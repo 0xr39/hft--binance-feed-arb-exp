@@ -1,3 +1,5 @@
+use crate::util;
+
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt;
@@ -28,6 +30,7 @@ pub enum StreamSource {
     Other(&'static str),
 }
 
+// Cosmetic
 impl std::fmt::Display for StreamSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -208,22 +211,14 @@ impl From<serde_json::Error> for StreamError {
 // Parse helpers
 // ---------------------------------------------------------------------------
 
-/// Wall-clock now in nanoseconds since the Unix epoch.
-fn now_nanos() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO)
-        .as_nanos() as i64
-}
-
 /// Convert `[price_str, qty_str]` pairs into `PriceLevel`s.
 fn parse_levels(pairs: &[[String; 2]]) -> Vec<PriceLevel> {
     pairs
         .iter()
-        .map(|[p, q]| PriceLevel {
-            price: p.parse().unwrap_or(0.0),
-            qty: q.parse().unwrap_or(0.0),
-        })
+        .map(|[p, q]| PriceLevel::new(
+            p.parse().unwrap_or(0.0),
+            q.parse().unwrap_or(0.0),
+        ))
         .collect()
 }
 
@@ -250,7 +245,7 @@ fn parse_book_update(text: &str) -> Result<BookUpdate, StreamError> {
     let payload: CombinedPayload = serde_json::from_str(text)?;
     let source = identify_source(&payload.stream)
         .ok_or_else(|| StreamError::UnknownStream(payload.stream.clone()))?;
-    let local_ts = now_nanos();
+    let local_ts = util::now_nanos();
 
     match source {
         StreamSource::BookTicker => {
@@ -265,14 +260,8 @@ fn parse_book_update(text: &str) -> Result<BookUpdate, StreamError> {
                 source,
                 exch_ts,
                 local_ts,
-                bids: vec![PriceLevel {
-                    price: bid_price,
-                    qty: bid_qty,
-                }],
-                asks: vec![PriceLevel {
-                    price: ask_price,
-                    qty: ask_qty,
-                }],
+                bids: vec![PriceLevel::new(bid_price, bid_qty)],
+                asks: vec![PriceLevel::new(ask_price, ask_qty)],
                 is_snapshot: false,
             })
         }
@@ -303,6 +292,17 @@ fn parse_book_update(text: &str) -> Result<BookUpdate, StreamError> {
     }
 }
 
+/// 3 version of endpoint
+/// wss://stream.binance.com:9443/stream
+/// wss://fstream.binance.com/public/stream
+/// wss://stream.binancefuture.com/public/stream
+/// This multiplexed
+pub mod urls {
+    pub const WS_A: &str = "wss://stream.binance.com:9443/stream";
+    pub const WS_B: &str = "wss://fstream.binance.com/public/stream";
+    pub const WS_C: &str = "wss://stream.binancefuture.com/public/stream";
+}
+
 // ---------------------------------------------------------------------------
 // Stream receiver
 // ---------------------------------------------------------------------------
@@ -315,7 +315,6 @@ fn parse_book_update(text: &str) -> Result<BookUpdate, StreamError> {
 ///
 /// A single WebSocket connection subscribes to **all configured streams**
 /// via Binance's combined-streams endpoint
-/// (`wss://stream.binance.com:9443/stream?streams=...`). This multiplexed
 /// approach minimises connection overhead and keeps messages arriving in
 /// true chronological order, which avoids ordering ambiguity that can occur
 /// with per-stream channels.
@@ -371,9 +370,79 @@ impl StreamReceiver {
         let stream_names: Vec<String> =
             self.configs.iter().map(|c| c.stream_name()).collect();
         format!(
-            "wss://stream.binance.com:9443/stream?streams={}",
+            "{}?streams={}",
+            urls::WS_B,
             stream_names.join("/")
         )
+    }
+
+    // -----------------------------------------------------------------------
+    // Dry-run: print received messages without touching the book
+    // -----------------------------------------------------------------------
+
+    /// Connect to the Binance streams and print every raw message without
+    /// parsing or updating the order book. Reconnects with exponential backoff.
+    pub async fn dry_run(&self) {
+        // Install the default rustls CryptoProvider (ring) so TLS setup
+        // doesn't panic. If already installed, this is a no-op.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        loop {
+            let url = self.build_ws_url();
+            eprintln!("[dry-run] Connecting to {url}");
+
+            let (ws, _) = match connect_async(&url).await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    eprintln!("[dry-run] Connect error: {e} — retrying in 5s");
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
+                }
+            };
+
+            let (_, mut read) = ws.split();
+
+            while let Some(msg) = read.next().await {
+                match msg {
+                    Ok(Message::Text(text)) => {
+                        match parse_book_update(&text) {
+                            Ok(update) => {
+                                let bid_str = if update.bids.is_empty() {
+                                    "no bids".into()
+                                } else {
+                                    format!("{} levels", update.bids.len())
+                                };
+                                let ask_str = if update.asks.is_empty() {
+                                    "no asks".into()
+                                } else {
+                                    format!("{} levels", update.asks.len())
+                                };
+                                let kind = if update.is_snapshot { "snapshot" } else { "diff" };
+                                eprintln!(
+                                    "[dry-run] {}  {}  {}  {}",
+                                    update.source, kind, bid_str, ask_str,
+                                );
+                            }
+                            Err(StreamError::UnknownStream(_)) => {}
+                            Err(e) => {
+                                eprintln!("[dry-run] Parse error: {e}");
+                            }
+                        }
+                    }
+                    Ok(Message::Close(frame)) => {
+                        eprintln!("[dry-run] Connection closed: {frame:?}");
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        break;
+                    }
+                    Ok(Message::Ping(_)) => {}
+                    Err(e) => {
+                        eprintln!("[dry-run] Read error: {e}");
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -387,6 +456,7 @@ impl StreamReceiver {
     /// The `on_update` callback is invoked after every successfully parsed
     /// and applied book update.
     pub async fn run(&mut self, mut on_update: Box<dyn FnMut(&LocalOrderBook) + Send>) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         loop {
             let url = self.build_ws_url();
             eprintln!("[stream] Connecting to {url}");

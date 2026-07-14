@@ -14,6 +14,13 @@ pub struct PriceLevel {
     pub qty: f64,
 }
 
+impl PriceLevel {
+    /// Create a new level with only price/qty.
+    pub fn new(price: f64, qty: f64) -> Self {
+        Self { price, qty }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Book update event
 // ---------------------------------------------------------------------------
@@ -82,6 +89,10 @@ struct LevelMeta {
     source: StreamSource,
     /// Exchange timestamp of the last update to this level.
     last_exch_ts: i64,
+    /// Local receive timestamp of the last update to this level.
+    last_local_ts: i64,
+    /// Network delay at the time of apply: now - exch_ts (ns).
+    delay_ns: i64,
 }
 
 impl LocalOrderBook {
@@ -169,10 +180,16 @@ impl LocalOrderBook {
         self.last_local_ts = update.local_ts;
         self.update_count += 1;
 
+        // Wall-clock "now" for delay computation.
+        let now_ns = crate::util::now_nanos();
+        let delay_ns = now_ns - update.exch_ts;
+
         let store = |map: &mut BTreeMap<u64, LevelMeta>,
                      level: &PriceLevel,
                      source: StreamSource,
-                     exch_ts: i64| {
+                     exch_ts: i64,
+                     local_ts: i64,
+                     dly_ns: i64| {
             let tick = (level.price / self.tick_size).round() as u64;
             if level.qty == 0.0 {
                 map.remove(&tick);
@@ -183,6 +200,8 @@ impl LocalOrderBook {
                         qty: level.qty,
                         source,
                         last_exch_ts: exch_ts,
+                        last_local_ts: local_ts,
+                        delay_ns: dly_ns,
                     },
                 );
             }
@@ -199,10 +218,10 @@ impl LocalOrderBook {
         }
 
         for bid in &update.bids {
-            store(&mut self.bids, bid, update.source, update.exch_ts);
+            store(&mut self.bids, bid, update.source, update.exch_ts, update.local_ts, delay_ns);
         }
         for ask in &update.asks {
-            store(&mut self.asks, ask, update.source, update.exch_ts);
+            store(&mut self.asks, ask, update.source, update.exch_ts, update.local_ts, delay_ns);
         }
 
         eprintln!(
@@ -240,22 +259,43 @@ impl LocalOrderBook {
 // Display
 // ---------------------------------------------------------------------------
 
+impl LocalOrderBook {
+    /// Write all ask levels with delay info to a formatter.
+    fn write_asks(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (_tick, meta) in self.asks.iter() {
+            let price = *_tick as f64 * self.tick_size;
+            writeln!(f, "  {:.1} @ {:.1}  delay={}µs", meta.qty, price, meta.delay_ns / 1000)?;
+        }
+        Ok(())
+    }
+
+    /// Write all bid levels with delay info to a formatter.
+    fn write_bids(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (_tick, meta) in self.bids.iter().rev() {
+            let price = *_tick as f64 * self.tick_size;
+            writeln!(f, "  {:.1} @ {:.1}  delay={}µs", meta.qty, price, meta.delay_ns / 1000)?;
+        }
+        Ok(())
+    }
+}
+
 impl std::fmt::Display for LocalOrderBook {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "── {} ──", self.symbol)?;
-        writeln!(f, "  Bids ({}) | Asks ({})", self.bid_depth(), self.ask_depth())?;
+        writeln!(
+            f,
+            "  Asks ({}) | Bids ({})",
+            self.ask_depth(),
+            self.bid_depth()
+        )?;
         if let Some(src) = self.last_source() {
             writeln!(f, "  Last update: {src} ({})", self.update_count())?;
         }
-        // Top 5 bids
-        for lvl in self.bids().take(5) {
-            writeln!(f, "  {:.1} @ {:.1}", lvl.qty, lvl.price)?;
-        }
+        // All asks (printed first)
+        self.write_asks(f)?;
         writeln!(f, "  ───────")?;
-        // Top 5 asks
-        for lvl in self.asks().take(5) {
-            writeln!(f, "  {:.1} @ {:.1}", lvl.qty, lvl.price)?;
-        }
+        // All bids
+        self.write_bids(f)?;
         Ok(())
     }
 }
@@ -277,8 +317,8 @@ mod tests {
             source: StreamSource::PartialBookDepth,
             exch_ts: 1_000_000,
             local_ts: 1_000_001,
-            bids: vec![PriceLevel { price: 100.0, qty: 1.0 }],
-            asks: vec![PriceLevel { price: 101.0, qty: 2.0 }],
+            bids: vec![PriceLevel::new(100.0, 1.0)],
+            asks: vec![PriceLevel::new(101.0, 2.0)],
             is_snapshot: true,
         };
         book.apply(&snap);
@@ -290,8 +330,8 @@ mod tests {
             source: StreamSource::DiffBookDepth,
             exch_ts: 2_000_000,
             local_ts: 2_000_001,
-            bids: vec![PriceLevel { price: 99.0, qty: 3.0 }],
-            asks: vec![PriceLevel { price: 102.0, qty: 1.0 }],
+            bids: vec![PriceLevel::new(99.0, 3.0)],
+            asks: vec![PriceLevel::new(102.0, 1.0)],
             is_snapshot: true,
         };
         book.apply(&snap2);
@@ -311,8 +351,8 @@ mod tests {
             source: StreamSource::PartialBookDepth,
             exch_ts: 1,
             local_ts: 1,
-            bids: vec![PriceLevel { price: 2000.0, qty: 10.0 }],
-            asks: vec![PriceLevel { price: 2001.0, qty: 5.0 }],
+            bids: vec![PriceLevel::new(2000.0, 10.0)],
+            asks: vec![PriceLevel::new(2001.0, 5.0)],
             is_snapshot: true,
         });
 
@@ -321,10 +361,10 @@ mod tests {
             source: StreamSource::DiffBookDepth,
             exch_ts: 2,
             local_ts: 2,
-            bids: vec![PriceLevel { price: 2000.0, qty: 15.0 }],
+            bids: vec![PriceLevel::new(2000.0, 15.0)],
             asks: vec![
-                PriceLevel { price: 2001.0, qty: 0.0 },  // remove
-                PriceLevel { price: 2002.0, qty: 3.0 },  // add
+                PriceLevel::new(2001.0, 0.0),  // remove
+                PriceLevel::new(2002.0, 3.0),  // add
             ],
             is_snapshot: false,
         });
@@ -341,7 +381,7 @@ mod tests {
             source: StreamSource::BookTicker,
             exch_ts: 1,
             local_ts: 1,
-            bids: vec![PriceLevel { price: 100.0, qty: 1.0 }],
+            bids: vec![PriceLevel::new(100.0, 1.0)],
             asks: vec![],
             is_snapshot: true,
         });

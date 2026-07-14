@@ -1,11 +1,11 @@
 mod book;
 mod stream;
+mod util;
 
 use std::time::Instant;
 
 use stream::{StreamConfig, StreamReceiver};
 
-#[tokio::main]
 async fn stream_to_book() {
     println!("=== hft--binance-feed-arb-exp  |  Async Stream Receiver ===\n");
 
@@ -33,6 +33,22 @@ async fn stream_to_book() {
         .await;
 }
 
+async fn stream_dry_run() {
+    println!("=== hft--binance-feed-arb-exp  |  Async Stream Receiver (dry-run) ===\n");
+
+    // Configure all four streams for a single combined WebSocket connection.
+    let configs = vec![
+        StreamConfig::book_ticker("BTCUSDT"),
+        StreamConfig::partial_depth("BTCUSDT", 20, 100),
+        StreamConfig::partial_depth("BTCUSDT", 20, 250),
+        StreamConfig::diff_depth("BTCUSDT", 100),
+        StreamConfig::diff_depth("BTCUSDT", 250),
+    ];
+
+    let mut receiver = StreamReceiver::new("BTCUSDT", 0.1, 0.001, configs);
+
+    receiver.dry_run().await;
+}
 /*
 [apply]  22458 ns  |  3 bids, 3 asks  |  source=partial_book_depth
 [apply]    542 ns  |  1 bids, 1 asks  |  source=book_ticker
@@ -42,23 +58,23 @@ some overhead in the first run?
  */
 fn mock_book() {
     // ── Create a book for BTCUSDT ──────────────────────────────────────
-    let mut book = book::LocalOrderBook::new("BTCUSDT", 0.1, 0.001);
+    let mut book = book::LocalOrderBook::new("BTCUSDT", 0.01, 0.001);
 
     // ── 1. Initial snapshot from Partial Book Depth Stream ─────────────
     println!("[1] Snapshot  (source: partial_book_depth)");
     book.apply(&book::BookUpdate {
         source: stream::StreamSource::PartialBookDepth,
         exch_ts: 1746057600003000000,
-        local_ts: 1746057600003500000,
+        local_ts: util::now_nanos(),
         bids: vec![
-            book::PriceLevel { price: 96351.4, qty: 6.344 },
-            book::PriceLevel { price: 96350.0, qty: 2.100 },
-            book::PriceLevel { price: 96348.2, qty: 0.500 },
+            book::PriceLevel::new(96351.4, 6.344),
+            book::PriceLevel::new(96350.0, 2.100),
+            book::PriceLevel::new(96348.2, 0.500),
         ],
         asks: vec![
-            book::PriceLevel { price: 96351.5, qty: 7.159 },
-            book::PriceLevel { price: 96352.0, qty: 3.200 },
-            book::PriceLevel { price: 96355.0, qty: 1.000 },
+            book::PriceLevel::new(96351.5, 7.159),
+            book::PriceLevel::new(96352.0, 3.200),
+            book::PriceLevel::new(96355.0, 1.000),
         ],
         is_snapshot: true,
     });
@@ -72,9 +88,9 @@ fn mock_book() {
     book.apply(&book::BookUpdate {
         source: stream::StreamSource::BookTicker,
         exch_ts: 1746057600300000000,
-        local_ts: 1746057600300500000,
-        bids: vec![book::PriceLevel { price: 96351.4, qty: 6.878 }],
-        asks: vec![book::PriceLevel { price: 96351.5, qty: 0.178 }],
+        local_ts: util::now_nanos(),
+        bids: vec![book::PriceLevel::new(96351.4, 6.878)],
+        asks: vec![book::PriceLevel::new(96351.5, 0.178)],
         is_snapshot: false,
     });
     println!("  Best bid qty: {}", book.best_bid().unwrap().qty);
@@ -86,13 +102,13 @@ fn mock_book() {
     book.apply(&book::BookUpdate {
         source: stream::StreamSource::DiffBookDepth,
         exch_ts: 1746057600600000000,
-        local_ts: 1746057600600500000,
+        local_ts: util::now_nanos(),
         bids: vec![
-            book::PriceLevel { price: 96351.4, qty: 5.001 },  // updated qty
-            book::PriceLevel { price: 96349.0, qty: 1.200 },  // new level
+            book::PriceLevel::new(96351.4, 5.001),  // updated qty
+            book::PriceLevel::new(96349.0, 1.200),  // new level
         ],
         asks: vec![
-            book::PriceLevel { price: 96355.0, qty: 0.0 },    // removed (qty=0)
+            book::PriceLevel::new(96355.0, 0.0),    // removed (qty=0)
         ],
         is_snapshot: false,
     });
@@ -107,6 +123,14 @@ fn mock_book() {
     println!("  Ask depth    : {}", book.ask_depth());
 }
 
-fn main() {
-    mock_book();
+#[tokio::main]
+async fn main() {
+    // Run the async stream receiver and print book state every 5 seconds.
+    // stream_to_book().await;
+
+    // Run the async stream receiver in dry-run mode (print messages only).
+    stream_dry_run().await;
+
+    // Run a mock book update sequence to demonstrate book behavior.
+    // mock_book();
 }
