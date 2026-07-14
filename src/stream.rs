@@ -159,9 +159,11 @@ struct BookTickerEvent {
 /// Partial Book Depth snapshot event.
 #[derive(Deserialize)]
 struct PartialDepthEvent {
-    #[serde(rename = "lastUpdateId")]
-    _last_update_id: u64,
+    #[serde(rename = "E")]
+    event_time: i64,
+    #[serde(rename = "b")]
     bids: Vec<[String; 2]>,
+    #[serde(rename = "a")]
     asks: Vec<[String; 2]>,
 }
 
@@ -273,19 +275,18 @@ fn parse_book_update(text: &str) -> Result<BookUpdate, StreamError> {
                 local_ts,
                 bids: parse_levels(&ev.bids),
                 asks: parse_levels(&ev.asks),
-                is_snapshot: false,
+                is_snapshot: true,
             })
         }
         StreamSource::PartialBookDepth => {
             let ev: PartialDepthEvent = serde_json::from_value(payload.data)?;
             Ok(BookUpdate {
                 source,
-                // No event_time in partial depth; use local_ts as fallback
-                exch_ts: local_ts,
+                exch_ts: ev.event_time * 1_000_000,
                 local_ts,
                 bids: parse_levels(&ev.bids),
                 asks: parse_levels(&ev.asks),
-                is_snapshot: true,
+                is_snapshot: false,
             })
         }
         StreamSource::Other(_) => Err(StreamError::UnknownStream(payload.stream)),
@@ -419,8 +420,8 @@ impl StreamReceiver {
                                 };
                                 let kind = if update.is_snapshot { "snapshot" } else { "diff" };
                                 eprintln!(
-                                    "[dry-run] {}  {}  {}  {}",
-                                    update.source, kind, bid_str, ask_str,
+                                    "[dry-run] {}  {}  {}  {} delay: {} ms",
+                                    update.source, kind, bid_str, ask_str, (update.exch_ts - update.local_ts)/1_000_000 
                                 );
                             }
                             Err(StreamError::UnknownStream(_)) => {}
