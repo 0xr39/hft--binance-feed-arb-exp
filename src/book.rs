@@ -1,3 +1,4 @@
+use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 use std::time::Instant;
 
@@ -191,28 +192,35 @@ impl LocalOrderBook {
                      local_ts: i64,
                      dly_ns: i64| {
             let tick = (level.price / self.tick_size).round() as u64;
-            // Only apply the update if it is newer than what is already stored,
-            // to guard against out-of-order arrivals from different streams.
-            let is_newer = match map.get(&tick) {
-                Some(existing) => exch_ts > existing.last_exch_ts,
-                None => true,
-            };
-            if !is_newer {
-                return;
-            }
-            if level.qty == 0.0 {
-                map.remove(&tick);
-            } else {
-                map.insert(
-                    tick,
-                    LevelMeta {
-                        qty: level.qty,
-                        source,
-                        last_exch_ts: exch_ts,
-                        last_local_ts: local_ts,
-                        delay_ns: dly_ns,
-                    },
-                );
+            // Single O(log n) lookup via Entry API — checks staleness and
+            // inserts/removes in one tree traversal.
+            match map.entry(tick) {
+                Entry::Vacant(entry) => {
+                    if level.qty != 0.0 {
+                        entry.insert(LevelMeta {
+                            qty: level.qty,
+                            source,
+                            last_exch_ts: exch_ts,
+                            last_local_ts: local_ts,
+                            delay_ns: dly_ns,
+                        });
+                    }
+                }
+                Entry::Occupied(mut entry) => {
+                    if exch_ts > entry.get().last_exch_ts {
+                        if level.qty == 0.0 {
+                            entry.remove();
+                        } else {
+                            entry.insert(LevelMeta {
+                                qty: level.qty,
+                                source,
+                                last_exch_ts: exch_ts,
+                                last_local_ts: local_ts,
+                                delay_ns: dly_ns,
+                            });
+                        }
+                    }
+                }
             }
         };
 
