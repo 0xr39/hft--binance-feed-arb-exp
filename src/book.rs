@@ -1,36 +1,6 @@
 use std::collections::BTreeMap;
 
-// ---------------------------------------------------------------------------
-// Stream source identification
-// ---------------------------------------------------------------------------
-
-/// Identifies which Binance WebSocket stream produced an update.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum StreamSource {
-    /// ## Partial Book Depth Stream (`<symbol>@depth<levels>@<speed>ms`)
-    /// e.g. `btcusdt@depth20@100ms`
-    /// Periodic snapshots of the top N price levels.
-    PartialBookDepth,
-    /// ## Individual Symbol Book Ticker Stream (`<symbol>@bookTicker`)
-    /// Real-time BBO (best bid/ask) — fires on every quote change.
-    BookTicker,
-    /// ## Diff. Book Depth Stream (`<symbol>@depth@<speed>ms`)
-    /// Incremental delta updates: which price levels changed and how.
-    DiffBookDepth,
-    /// Placeholder for newly discovered streams added later.
-    Other(&'static str),
-}
-
-impl std::fmt::Display for StreamSource {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::PartialBookDepth => write!(f, "partial_book_depth"),
-            Self::BookTicker => write!(f, "book_ticker"),
-            Self::DiffBookDepth => write!(f, "diff_book_depth"),
-            Self::Other(name) => write!(f, "other({name})"),
-        }
-    }
-}
+pub use crate::stream::StreamSource;
 
 // ---------------------------------------------------------------------------
 // Price level
