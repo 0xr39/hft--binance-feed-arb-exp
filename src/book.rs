@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::time::Instant;
 
 pub use crate::stream::StreamSource;
 
@@ -161,6 +162,8 @@ impl LocalOrderBook {
     /// * **Incremental (diff)** – upserts bid/ask levels. A level with
     ///   `qty == 0.0` is removed (Binance diff-book convention).
     pub fn apply(&mut self, update: &BookUpdate) {
+        let start = Instant::now();
+
         self.last_update_source = Some(update.source);
         self.last_exch_ts = update.exch_ts;
         self.last_local_ts = update.local_ts;
@@ -201,6 +204,14 @@ impl LocalOrderBook {
         for ask in &update.asks {
             store(&mut self.asks, ask, update.source, update.exch_ts);
         }
+
+        eprintln!(
+            "[apply] {:>6} ns  |  {} bids, {} asks  |  source={}",
+            start.elapsed().as_nanos(),
+            update.bids.len(),
+            update.asks.len(),
+            update.source,
+        );
     }
 
     // -----------------------------------------------------------------------

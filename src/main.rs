@@ -6,7 +6,7 @@ use std::time::Instant;
 use stream::{StreamConfig, StreamReceiver};
 
 #[tokio::main]
-async fn main() {
+async fn stream_to_book() {
     println!("=== hft--binance-feed-arb-exp  |  Async Stream Receiver ===\n");
 
     // Configure all four streams for a single combined WebSocket connection.
@@ -15,6 +15,7 @@ async fn main() {
         StreamConfig::partial_depth("BTCUSDT", 20, 100),
         StreamConfig::partial_depth("BTCUSDT", 20, 250),
         StreamConfig::diff_depth("BTCUSDT", 100),
+        StreamConfig::diff_depth("BTCUSDT", 250),
     ];
 
     let mut receiver = StreamReceiver::new("BTCUSDT", 0.1, 0.001, configs);
@@ -32,6 +33,13 @@ async fn main() {
         .await;
 }
 
+/*
+[apply]  22458 ns  |  3 bids, 3 asks  |  source=partial_book_depth
+[apply]    542 ns  |  1 bids, 1 asks  |  source=book_ticker
+[apply]   1708 ns  |  2 bids, 1 asks  |  source=diff_book_depth
+
+some overhead in the first run?
+ */
 fn mock_book() {
     // ── Create a book for BTCUSDT ──────────────────────────────────────
     let mut book = book::LocalOrderBook::new("BTCUSDT", 0.1, 0.001);
@@ -97,4 +105,8 @@ fn mock_book() {
     println!("  Last source  : {:?}", book.last_source());
     println!("  Bid depth    : {}", book.bid_depth());
     println!("  Ask depth    : {}", book.ask_depth());
+}
+
+fn main() {
+    mock_book();
 }
