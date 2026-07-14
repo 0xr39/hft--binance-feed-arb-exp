@@ -204,6 +204,61 @@ bookTicker `apply()` drops from ~542 ns → **~20-50 ns** (a few field assignmen
 
 ## Future Optimization Ideas
 
+### Parallelize bids and asks with `rayon::join`
+
+`self.bids` and `self.asks` are completely independent `BTreeMap`s — no aliasing, no data race. They can be processed concurrently to cut wall time for large updates roughly in half:
+
+```rust
+use rayon::join;
+
+// Inside apply(), after snapshot handling:
+join(
+    || { for bid in &update.bids { store(&mut self.bids, bid, ...); } },
+    || { for ask in &update.asks { store(&mut self.asks, ask, ...); } },
+);
+```
+
+**Overhead:** `rayon::join` costs ~0.5–2 µs for work-stealing coordination.
+
+| Update type | Sequential | Parallel (est.) | Worth it? |
+|---|---|---|---|
+| book_ticker (1b+1a, ~500 ns) | 500 ns | ~2.5 µs (worse!) | ❌ No — overhead dominates |
+| depth update (70 levels, ~33 µs) | 33 µs | ~18 µs | ✅ Yes — ~45% faster |
+
+**Recommendation:** Only parallelize when `update.bids.len() + update.asks.len()` exceeds some threshold (e.g. >4 levels total). Or gate it behind a branch: small updates stay sequential, large diffs take the parallel path.
+
+### Inline the `store` closure as a standalone `fn`
+
+The `store` closure is currently defined **inside** `apply()` — it's re-created on every call with fresh captures. Lifting it to a standalone `fn` (or a method on `LocalOrderBook`) eliminates the closure capture overhead and gives the compiler better inlining visibility:
+
+```rust
+// Current: closure created per apply() call
+let store = |map: &mut BTreeMap<u64, LevelMeta>, level: &PriceLevel, ...| { ... };
+
+// Proposed: standalone method
+fn store_level(
+    map: &mut BTreeMap<u64, LevelMeta>,
+    level: &PriceLevel,
+    source: StreamSource,
+    exch_ts: i64,
+    local_ts: i64,
+    delay_ns: i64,
+    tick_size: f64,
+) { ... }
+```
+
+The compiler may already be inlining this in release mode, but in debug builds the closure overhead adds measurable cost. Making it a `fn` is a zero-risk change with no downsides.
+
+### Offload timing log to a background thread
+
+The `RefCell<Vec<TimingRecord>>` push at the end of every `apply()` is cheap but not free — it contends with the hot path for cache and has a (small) allocation cost. Options:
+
+- **`mpsc::Sender` + background consumer thread** — push timing records into a channel; a dedicated thread drains them and batches the `eprintln!`. Removes all timing overhead from the hot path at the cost of one atomic write per `apply()`.
+- **Per-core sharded counters** — use a sharded atomics approach (like `metrics` crate) to avoid any shared-memory contention. Overkill unless the book is shared across threads.
+- **Simple flag** — if not profiling, skip the timing log entirely at compile time via `cfg!(feature = "profiling")`. Zero cost when disabled.
+
+**Trade-off:** Adding a channel send (~20–50 ns) for every `apply()` to save a `Vec::push` (~5–15 ns) only makes sense if the consumer thread does expensive I/O that would otherwise block the hot path. The current batched approach (flush every 5s) already keeps per-call cost minimal.
+
 ### Slot-map for levels (pre-allocated)
 
 If the book stabilizes at ~100-200 levels per side, a slot-map or `Vec<(u64, LevelMeta)>` with binary search could outperform BTreeMap by avoiding pointer chasing and allocation. Only worth exploring if BTreeMap becomes a measured bottleneck in release mode.
