@@ -21,15 +21,17 @@ description: 'LocalOrderBook data structure, stream fusion semantics, and speed 
 
 ```
 LocalOrderBook
-├── bids: BTreeMap<u64, LevelMeta>    # price in ticks -> metadata
-├── asks: BTreeMap<u64, LevelMeta>    # price in ticks -> metadata
+├── bids: BTreeMap<u64, LevelMeta>       # price in ticks -> metadata
+├── asks: BTreeMap<u64, LevelMeta>       # price in ticks -> metadata
+├── timing_log: RefCell<Vec<TimingRecord>>  # batched timing buffer
 ├── last_update_source: Option<StreamSource>
 ├── last_exch_ts: i64
 ├── last_local_ts: i64
 ├── update_count: u64
 └── (metadata: symbol, tick_size, lot_size)
 
-LevelMeta { qty: f64, source: StreamSource, last_exch_ts: i64 }
+LevelMeta { qty: f64, source: StreamSource, last_exch_ts: i64, last_local_ts: i64, delay_ns: i64 }
+TimingRecord { elapsed_ns: u128, bids: u32, asks: u32, source: StreamSource }
 ```
 
 - **Bids sorted descending** (highest price first). `BTreeMap` iterates ascending, so `bids.iter().rev()`.
@@ -41,7 +43,7 @@ LevelMeta { qty: f64, source: StreamSource, last_exch_ts: i64 }
 1. Record metadata: `last_update_source`, `last_exch_ts`, `last_local_ts`, `update_count++`
 2. If snapshot, `clear()` the relevant side(s)
 3. For each bid/ask level: `store()` closure — compute tick, check timestamp guard, then `remove` if qty==0 else `insert`
-4. `eprintln!` timing
+4. `self.timing_log.borrow_mut().push(TimingRecord { ... })` — pushes a cheap struct (no heap alloc, no syscall)
 
 ### Timestamp-guarded writes
 
@@ -60,15 +62,72 @@ When multiple conflated streams feed the same book, updates for the same price l
 | `DiffBookDepth` | Every 100ms or 250ms | Variable (N changed levels) | Full book diffs |
 | `PartialBookDepth` | Every 100ms or 250ms | Top N levels (snapshot) | Full book snapshots |
 
-### Profiling baseline (debug mode, mock 3-update scenario)
+### Profiling baseline (debug mode, live Binance streams)
 
 ```
-[apply]  22458 ns  |  3 bids, 3 asks  |  source=partial_book_depth   # first call: cold cache + alloc
-[apply]    542 ns  |  1 bids, 1 asks  |  source=book_ticker           # hot cache, update existing
-[apply]   1708 ns  |  2 bids, 1 asks  |  source=diff_book_depth       # mix of insert/remove
+[apply]   1250 ns  |  1 bids, 1 asks  |  source=book_ticker
+[apply]   1167 ns  |  1 bids, 1 asks  |  source=book_ticker
+[apply]    958 ns  |  1 bids, 1 asks  |  source=book_ticker
+[apply]   1000 ns  |  1 bids, 1 asks  |  source=book_ticker
+[apply]   1042 ns  |  1 bids, 1 asks  |  source=book_ticker
+[apply]   1500 ns  |  1 bids, 1 asks  |  source=book_ticker
+[apply]   1375 ns  |  1 bids, 1 asks  |  source=book_ticker
+[apply]  32583 ns  |  46 bids, 24 asks  |  source=diff_book_depth
+[apply]   7875 ns  |  20 bids, 20 asks  |  source=partial_book_depth
+[apply]  18417 ns  |  18 bids, 10 asks  |  source=diff_book_depth
+[apply]   3334 ns  |  20 bids, 20 asks  |  source=partial_book_depth
+[apply]   4625 ns  |  18 bids, 15 asks  |  source=diff_book_depth
+[apply]   3625 ns  |  20 bids, 20 asks  |  source=partial_book_depth
+[apply]   5375 ns  |  18 bids, 12 asks  |  source=diff_book_depth
 ```
 
-First call overhead: cold instruction/data cache + `BTreeMap` root node heap allocation.
+Note: `eprintln!` has been removed from the hot path — these timings reflect pure book logic + `Vec::push` for the timing buffer. The 171 µs outlier from the old per-call `eprintln!` approach is gone. The current bottleneck is BTreeMap operations on depth updates (up to ~33 µs for 70 levels).
+
+---
+
+## Batched Timing Log (applied 2026-07-15)
+
+### Motivation
+
+The original `eprintln!` at the end of every `apply()` call caused:
+- **Lock contention**: acquiring `stderr`'s mutex (~50-500 ns depending on contention)
+- **Syscall overhead**: `write()` to stderr (~50-200 ns)
+- **Format allocation**: heap allocation for the formatted string
+
+For hot paths like `book_ticker` (333-500 ns total), the `eprintln!` alone could **double or triple** latency.
+
+### Design
+
+Replace the per-call `eprintln!` with an in-memory buffer that accumulates timing records and flushes periodically:
+
+```
+LocalOrderBook
+└── timing_log: RefCell<Vec<TimingRecord>>
+```
+
+- `TimingRecord` is a small `Copy` struct (elapsed_ns, bids, asks, source)
+- `RefCell` enables interior mutability — the stream callback (which receives `&LocalOrderBook`) can flush the buffer without `&mut` access
+- Initial capacity is 256 elements, so after startup there are zero heap allocations per push
+
+### `flush_timing_log(&self)`
+
+- Drains all buffered records
+- Builds one big `String` (single heap allocation for the batch)
+- Calls `eprintln!` once — one lock acquisition, one write syscall
+- Called every **5 seconds** from `stream_to_book`'s callback in `main.rs`
+
+### Cost per `apply()` call
+
+Just a `Vec::push` (amortized O(1), no allocation after warmup) + the `Instant::now()` timing call. No lock, no syscall, no format alloc.
+
+### Expected improvement
+
+| Update type | Before (per-call eprintln) | After (batched) |
+|---|---|---|
+| book_ticker (1b+1a) | 333-500 ns | ~100-200 ns |
+| depth update (55 levels) | 28-171 µs | ~5-10 µs (pure tree work) |
+
+The 171 µs outlier was dominated by stderr lock contention — batching eliminates that entirely.
 
 ---
 

@@ -18,13 +18,18 @@ async fn stream_to_book() {
         StreamConfig::diff_depth("BTCUSDT", 250),
     ];
 
-    let mut receiver = StreamReceiver::new("BTCUSDT", 0.1, 0.001, configs);
+    let mut receiver: StreamReceiver = StreamReceiver::new("BTCUSDT", 0.1, 0.001, configs);
 
-    // Print book state every 20 seconds.
+    // Print book state every 20 seconds, flush timing log every 5 seconds.
     let mut last_print = Instant::now();
+    let mut last_flush = Instant::now();
 
     receiver
         .run(Box::new(move |book| {
+            if last_flush.elapsed().as_secs() >= 5 {
+                book.flush_timing_log();
+                last_flush = Instant::now();
+            }
             if last_print.elapsed().as_secs() >= 20 {
                 println!("{book}");
                 last_print = Instant::now();
@@ -50,11 +55,17 @@ async fn stream_dry_run() {
     receiver.dry_run().await;
 }
 /*
-[apply]  22458 ns  |  3 bids, 3 asks  |  source=partial_book_depth
-[apply]    542 ns  |  1 bids, 1 asks  |  source=book_ticker
-[apply]   1708 ns  |  2 bids, 1 asks  |  source=diff_book_depth
+[apply]    500 ns  |  1 bids, 1 asks  |  source=book_ticker
+[apply]    333 ns  |  1 bids, 1 asks  |  source=book_ticker
+[apply]    375 ns  |  1 bids, 1 asks  |  source=book_ticker
+[apply]   2833 ns  |  1 bids, 1 asks  |  source=book_ticker
+[apply]  27875 ns  |  33 bids, 19 asks  |  source=diff_book_depth
+[apply]  11125 ns  |  20 bids, 20 asks  |  source=partial_book_depth
+[apply]   2875 ns  |  1 bids, 1 asks  |  source=book_ticker
+[apply]   1541 ns  |  1 bids, 1 asks  |  source=book_ticker
+[apply] 171292 ns  |  32 bids, 23 asks  |  source=diff_book_depth
+[apply]   6875 ns  |  20 bids, 20 asks  |  source=partial_book_depth
 
-some overhead in the first run?
  */
 fn mock_book() {
     // ── Create a book for BTCUSDT ──────────────────────────────────────
@@ -126,10 +137,10 @@ fn mock_book() {
 #[tokio::main]
 async fn main() {
     // Run the async stream receiver and print book state every 5 seconds.
-    // stream_to_book().await;
+    stream_to_book().await;
 
     // Run the async stream receiver in dry-run mode (print messages only).
-    stream_dry_run().await;
+    // stream_dry_run().await;
 
     // Run a mock book update sequence to demonstrate book behavior.
     // mock_book();

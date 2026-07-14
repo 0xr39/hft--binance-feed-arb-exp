@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 use std::time::Instant;
@@ -71,6 +72,9 @@ pub struct LocalOrderBook {
     bids: BTreeMap<u64, LevelMeta>,   // price in ticks -> metadata
     asks: BTreeMap<u64, LevelMeta>,   // price in ticks -> metadata
 
+    // --- Profiling (batched timing log) -----------------------------------
+    timing_log: RefCell<Vec<TimingRecord>>,
+
     // --- Stream provenance tracking ---------------------------------------
     /// Updated on every `apply()`.
     last_update_source: Option<StreamSource>,
@@ -80,6 +84,15 @@ pub struct LocalOrderBook {
     last_local_ts: i64,
     /// Total number of updates applied since creation.
     update_count: u64,
+}
+
+/// A single timing measurement captured on each `apply()` call.
+#[derive(Debug, Clone, Copy)]
+pub struct TimingRecord {
+    pub elapsed_ns: u128,
+    pub bids: u32,
+    pub asks: u32,
+    pub source: StreamSource,
 }
 
 /// Per-level metadata, tacked onto the quantity stored in the book.
@@ -105,6 +118,7 @@ impl LocalOrderBook {
             lot_size,
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
+            timing_log: RefCell::new(Vec::with_capacity(256)),
             last_update_source: None,
             last_exch_ts: 0,
             last_local_ts: 0,
@@ -182,8 +196,8 @@ impl LocalOrderBook {
         self.update_count += 1;
 
         // Wall-clock "now" for delay computation.
-        let now_ns = crate::util::now_nanos();
-        let delay_ns = now_ns - update.exch_ts;
+        // let now_ns = crate::util::now_nanos();
+        let delay_ns = update.local_ts - update.exch_ts;
 
         let store = |map: &mut BTreeMap<u64, LevelMeta>,
                      level: &PriceLevel,
@@ -241,13 +255,12 @@ impl LocalOrderBook {
             store(&mut self.asks, ask, update.source, update.exch_ts, update.local_ts, delay_ns);
         }
 
-        eprintln!(
-            "[apply] {:>6} ns  |  {} bids, {} asks  |  source={}",
-            start.elapsed().as_nanos(),
-            update.bids.len(),
-            update.asks.len(),
-            update.source,
-        );
+        self.timing_log.borrow_mut().push(TimingRecord {
+            elapsed_ns: start.elapsed().as_nanos(),
+            bids: update.bids.len() as u32,
+            asks: update.asks.len() as u32,
+            source: update.source,
+        });
     }
 
     // -----------------------------------------------------------------------
@@ -269,6 +282,27 @@ impl LocalOrderBook {
         self.bids.clear();
         self.asks.clear();
         self.last_update_source = None;
+        self.timing_log.borrow_mut().clear();
+    }
+
+    /// Drain all buffered timing records and print them to stderr.
+    /// Call this periodically (e.g. every 5 seconds) from the stream callback.
+    pub fn flush_timing_log(&self) {
+        let mut log = self.timing_log.borrow_mut();
+        if log.is_empty() {
+            return;
+        }
+        let mut buf = String::with_capacity(log.len() * 64);
+        for rec in log.iter() {
+            use std::fmt::Write;
+            let _ = write!(
+                buf,
+                "[apply] {:>6} ns  |  {} bids, {} asks  |  source={}\n",
+                rec.elapsed_ns, rec.bids, rec.asks, rec.source,
+            );
+        }
+        eprintln!("{buf}");
+        log.clear();
     }
 }
 
