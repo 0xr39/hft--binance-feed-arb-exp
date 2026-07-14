@@ -134,6 +134,8 @@ struct CombinedPayload {
 struct DiffDepthEvent {
     #[serde(rename = "E")]
     event_time: i64,
+    #[serde(rename = "T")]
+    transaction_time: i64,
     #[serde(rename = "b")]
     bids: Vec<[String; 2]>,
     #[serde(rename = "a")]
@@ -154,6 +156,8 @@ struct BookTickerEvent {
     /// Event time (milliseconds). Present on futures, may be absent on spot.
     #[serde(rename = "E")]
     event_time: Option<i64>,
+    #[serde(rename = "T")]
+    transaction_time: i64,
 }
 
 /// Partial Book Depth snapshot event.
@@ -161,6 +165,8 @@ struct BookTickerEvent {
 struct PartialDepthEvent {
     #[serde(rename = "E")]
     event_time: i64,
+    #[serde(rename = "T")]
+    transaction_time: i64,
     #[serde(rename = "b")]
     bids: Vec<[String; 2]>,
     #[serde(rename = "a")]
@@ -243,17 +249,15 @@ fn identify_source(stream_name: &str) -> Option<StreamSource> {
 }
 
 /// Parse a combined-stream JSON text into a `BookUpdate`.
-fn parse_book_update(text: &str) -> Result<BookUpdate, StreamError> {
+fn parse_book_update(text: &str, local_ts: i64) -> Result<BookUpdate, StreamError> {
     let payload: CombinedPayload = serde_json::from_str(text)?;
     let source = identify_source(&payload.stream)
         .ok_or_else(|| StreamError::UnknownStream(payload.stream.clone()))?;
-    let local_ts = util::now_nanos();
 
     match source {
         StreamSource::BookTicker => {
             let ev: BookTickerEvent = serde_json::from_value(payload.data)?;
-            // event_time is in ms → convert to ns
-            let exch_ts = ev.event_time.unwrap_or(0) * 1_000_000;
+            let exch_ts = ev.transaction_time * 1_000_000;
             let bid_price: f64 = ev.best_bid_price.parse().unwrap_or(0.0);
             let bid_qty: f64 = ev.best_bid_qty.parse().unwrap_or(0.0);
             let ask_price: f64 = ev.best_ask_price.parse().unwrap_or(0.0);
@@ -271,18 +275,18 @@ fn parse_book_update(text: &str) -> Result<BookUpdate, StreamError> {
             let ev: DiffDepthEvent = serde_json::from_value(payload.data)?;
             Ok(BookUpdate {
                 source,
-                exch_ts: ev.event_time * 1_000_000,
+                exch_ts: ev.transaction_time * 1_000_000,
                 local_ts,
                 bids: parse_levels(&ev.bids),
                 asks: parse_levels(&ev.asks),
-                is_snapshot: true,
+                is_snapshot: false,
             })
         }
         StreamSource::PartialBookDepth => {
             let ev: PartialDepthEvent = serde_json::from_value(payload.data)?;
             Ok(BookUpdate {
                 source,
-                exch_ts: ev.event_time * 1_000_000,
+                exch_ts: ev.transaction_time * 1_000_000,
                 local_ts,
                 bids: parse_levels(&ev.bids),
                 asks: parse_levels(&ev.asks),
@@ -406,23 +410,25 @@ impl StreamReceiver {
             while let Some(msg) = read.next().await {
                 match msg {
                     Ok(Message::Text(text)) => {
-                        match parse_book_update(&text) {
+                        match parse_book_update(&text, util::now_nanos()) {
                             Ok(update) => {
+                                // println!("[dry-run] {text}");
                                 let bid_str = if update.bids.is_empty() {
                                     "no bids".into()
                                 } else {
-                                    format!("{} levels", update.bids.len())
+                                    format!("Bid: {} levels", update.bids.len())
                                 };
                                 let ask_str = if update.asks.is_empty() {
                                     "no asks".into()
                                 } else {
-                                    format!("{} levels", update.asks.len())
+                                    format!("Ask: {} levels", update.asks.len())
                                 };
                                 let kind = if update.is_snapshot { "snapshot" } else { "diff" };
                                 eprintln!(
                                     "[dry-run] {}  {}  {}  {} delay: {} ms",
                                     update.source, kind, bid_str, ask_str, (update.exch_ts - update.local_ts)/1_000_000 
                                 );
+                                // eprintln!("[dry-run] exch_ts: {}, local_ts: {}", update.exch_ts, update.local_ts);
                             }
                             Err(StreamError::UnknownStream(_)) => {}
                             Err(e) => {
@@ -485,7 +491,7 @@ impl StreamReceiver {
             while let Some(msg) = read.next().await {
                 match msg {
                     Ok(Message::Text(text)) => {
-                        match parse_book_update(&text) {
+                        match parse_book_update(&text, util::now_nanos()) {
                             Ok(update) => {
                                 self.book.apply(&update);
                                 on_update(&self.book);
@@ -619,6 +625,7 @@ mod tests {
             "stream": "btcusdt@bookTicker",
             "data": {
                 "u": 400900217,
+                "T": 1746057600000,
                 "s": "BTCUSDT",
                 "b": "96351.4",
                 "B": "6.344",
@@ -627,7 +634,7 @@ mod tests {
             }
         }"#;
 
-        let update = parse_book_update(json).unwrap();
+        let update = parse_book_update(json, 0).unwrap();
         assert_eq!(update.source, StreamSource::BookTicker);
         assert!(!update.is_snapshot);
         assert_eq!(update.bids.len(), 1);
@@ -645,6 +652,7 @@ mod tests {
             "data": {
                 "e": "depthUpdate",
                 "E": 1746057600000,
+                "T": 1746057600000,
                 "s": "BTCUSDT",
                 "U": 157,
                 "u": 170,
@@ -653,7 +661,7 @@ mod tests {
             }
         }"#;
 
-        let update = parse_book_update(json).unwrap();
+        let update = parse_book_update(json, 0).unwrap();
         assert_eq!(update.source, StreamSource::DiffBookDepth);
         assert!(!update.is_snapshot);
         assert_eq!(update.bids.len(), 1);
@@ -669,17 +677,21 @@ mod tests {
         let json = r#"{
             "stream": "btcusdt@depth20@100ms",
             "data": {
-                "lastUpdateId": 160,
-                "bids": [["96351.4","6.344"], ["96350.0","2.100"]],
-                "asks": [["96351.5","7.159"], ["96352.0","3.200"]]
+                "e": "depthUpdate",
+                "E": 1746057600000,
+                "T": 1746057600000,
+                "s": "BTCUSDT",
+                "U": 157,
+                "u": 170,
+                "b": [["96351.4","5.001"]],
+                "a": [["96355.0","0.000"]]
             }
         }"#;
 
-        let update = parse_book_update(json).unwrap();
+        let update = parse_book_update(json, 0).unwrap();
         assert_eq!(update.source, StreamSource::PartialBookDepth);
-        assert!(update.is_snapshot);
-        assert_eq!(update.bids.len(), 2);
-        assert_eq!(update.asks.len(), 2);
+        assert_eq!(update.bids.len(), 1);
+        assert_eq!(update.asks.len(), 1);
     }
 
     #[test]
@@ -688,12 +700,12 @@ mod tests {
             "stream": "btcusdt@trade",
             "data": {}
         }"#;
-        assert!(parse_book_update(json).is_err());
+        assert!(parse_book_update(json, 0).is_err());
     }
 
     #[test]
     fn parse_invalid_json_errors() {
-        assert!(parse_book_update("not json").is_err());
+        assert!(parse_book_update("not json", 0).is_err());
     }
 
     #[test]

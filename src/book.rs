@@ -191,6 +191,15 @@ impl LocalOrderBook {
                      local_ts: i64,
                      dly_ns: i64| {
             let tick = (level.price / self.tick_size).round() as u64;
+            // Only apply the update if it is newer than what is already stored,
+            // to guard against out-of-order arrivals from different streams.
+            let is_newer = match map.get(&tick) {
+                Some(existing) => exch_ts > existing.last_exch_ts,
+                None => true,
+            };
+            if !is_newer {
+                return;
+            }
             if level.qty == 0.0 {
                 map.remove(&tick);
             } else {

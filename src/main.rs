@@ -20,12 +20,12 @@ async fn stream_to_book() {
 
     let mut receiver = StreamReceiver::new("BTCUSDT", 0.1, 0.001, configs);
 
-    // Print book state every 5 seconds.
+    // Print book state every 20 seconds.
     let mut last_print = Instant::now();
 
     receiver
         .run(Box::new(move |book| {
-            if last_print.elapsed().as_secs() >= 5 {
+            if last_print.elapsed().as_secs() >= 20 {
                 println!("{book}");
                 last_print = Instant::now();
             }

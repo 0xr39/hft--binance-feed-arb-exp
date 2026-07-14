@@ -40,8 +40,17 @@ LevelMeta { qty: f64, source: StreamSource, last_exch_ts: i64 }
 
 1. Record metadata: `last_update_source`, `last_exch_ts`, `last_local_ts`, `update_count++`
 2. If snapshot, `clear()` the relevant side(s)
-3. For each bid/ask level: `store()` closure — compute tick, `remove` if qty==0, else `insert`
+3. For each bid/ask level: `store()` closure — compute tick, check timestamp guard, then `remove` if qty==0 else `insert`
 4. `eprintln!` timing
+
+### Timestamp-guarded writes
+
+When multiple conflated streams feed the same book, updates for the same price level can arrive out of order (e.g., a stale `DiffBookDepth` update arriving after a fresher `BookTicker` update). The `store()` closure guards against this:
+
+- Before any insert or remove, it checks `exch_ts > existing.last_exch_ts`.
+- If the incoming update is **older** (or equal) to what's already stored, it is **silently dropped** — the per-level `last_exch_ts` in `LevelMeta` serves as a Lamport-clock-style watermark.
+- This also protects against stale `qty == 0.0` deletes that could incorrectly remove a level re-added by a later update.
+- Snapshots bypass per-level timestamps (the side is cleared first, so there is no existing entry to compare against).
 
 ### Stream sources & frequencies
 
