@@ -138,7 +138,7 @@ fn store(
     delay_ns: i64,
     tick_size: f64,
 ) {
-    let tick = (level.price / tick_size).floor() as u64;
+    let tick = ((level.price + 1e-9) / tick_size).floor() as u64;
     match map.entry(tick) {
         Entry::Vacant(entry) => {
             if level.qty != 0.0 {
@@ -260,7 +260,7 @@ impl LocalOrderBook {
     /// Query which stream last updated a specific price level.
     /// Checks the BBO cache first, then the depth trees.
     pub fn source_at_price(&self, price: f64) -> Option<StreamSource> {
-        let tick = (price / self.tick_size).floor() as u64;
+        let tick = ((price + 1e-9) / self.tick_size).floor() as u64;
         // Check BBO cache first (tick match).
         if let Some((bbo_tick, _)) = self.bbo_bid {
             if bbo_tick == tick {
@@ -273,7 +273,7 @@ impl LocalOrderBook {
             }
         }
         // Fallback to depth trees.
-        let tick = (price / self.tick_size).floor() as u64;
+        let tick = ((price + 1e-9) / self.tick_size).floor() as u64;
         self.bids
             .get(&tick)
             .or_else(|| self.asks.get(&tick))
@@ -321,7 +321,7 @@ impl LocalOrderBook {
             }            
         } else if update.source == StreamSource::BookTicker {
             if let Some(bid) = update.bids.first() {
-                let tick = (bid.price / self.tick_size).floor() as u64;
+                let tick = ((bid.price + 1e-9) / self.tick_size).floor() as u64;
                 self.bbo_bid = Some((tick, LevelMeta {
                     qty: bid.qty,
                     source: StreamSource::BookTicker,
@@ -331,7 +331,7 @@ impl LocalOrderBook {
                 }));
             }
             if let Some(ask) = update.asks.first() {
-                let tick = (ask.price / self.tick_size).floor() as u64;
+                let tick = ((ask.price + 1e-9) / self.tick_size).floor() as u64;
                 self.bbo_ask = Some((tick, LevelMeta {
                     qty: ask.qty,
                     source: StreamSource::BookTicker,
