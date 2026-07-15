@@ -32,7 +32,7 @@ async fn stream_to_book() {
 
     // Configure streams. 100ms and 250ms just wont be accepted together, but different depth level can coexist
     let streams_configs = vec![
-        // StreamConfig::book_ticker(SYMBOL),
+        StreamConfig::book_ticker(SYMBOL),
         StreamConfig::partial_depth(SYMBOL, 5, 100),
         StreamConfig::partial_depth(SYMBOL, 10, 100),
         StreamConfig::partial_depth(SYMBOL, 20, 100),
@@ -58,7 +58,7 @@ async fn stream_to_book() {
                 book.flush_timing_log();
                 last_flush = Instant::now();
             }
-            if last_print.elapsed().as_secs() >= 1000000 {
+            if last_print.elapsed().as_secs() >= 15 {
                 println!("{:.10}", book);
                 last_print = Instant::now();
             }
