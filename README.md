@@ -114,7 +114,7 @@ Typical `apply()` latency on live Binance streams (full steroid release build, b
 | `partialBookDepth` (5-20 levels) | 5 - 20 | ~2000-10000 ns |
 | `diffBookDepth` | 10–100+ levels | ~30000 ns for a large update (100 bid 100 ask)|
 
-The batched timing log avoids `eprintln!` on the hot path — records are pushed to a `Vec<TimingRecord>` in ~ns and flushed asynchronously every 10s.
+The batched timing log avoids `eprintln!` on the hot path — records are pushed to a `Vec<TimingRecord>` in ~ns and flushed every 10s.
 
 ---
 
