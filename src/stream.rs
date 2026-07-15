@@ -383,7 +383,7 @@ impl StreamReceiver {
             rest_url,
             symbol: symbol.into(),
             snapshot_limit: 1000,
-            snapshot_interval: Duration::from_secs(60),
+            snapshot_interval: Duration::from_secs(30),
         }
     }
 

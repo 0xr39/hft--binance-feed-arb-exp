@@ -138,7 +138,7 @@ fn store(
     delay_ns: i64,
     tick_size: f64,
 ) {
-    let tick = (level.price / tick_size).round() as u64;
+    let tick = (level.price / tick_size).floor() as u64;
     match map.entry(tick) {
         Entry::Vacant(entry) => {
             if level.qty != 0.0 {
@@ -202,6 +202,12 @@ impl LocalOrderBook {
         })
     }
 
+    pub fn best_bid_tick(&self) -> Option<u64> {
+        self.bbo_bid
+            .map(|bbo| (bbo.price / self.tick_size).floor() as u64)
+            .or_else(|| self.bids.last_key_value().map(|(tick, _)| *tick))
+    }
+
     pub fn best_ask(&self) -> Option<PriceLevel> {
         self.bbo_ask.or_else(|| {
             self.asks.first_key_value().map(|(tick, m)| PriceLevel {
@@ -209,6 +215,12 @@ impl LocalOrderBook {
                 qty: m.qty,
             })
         })
+    }
+
+    pub fn best_ask_tick(&self) -> Option<u64> {
+        self.bbo_ask
+            .map(|bbo| (bbo.price / self.tick_size).floor() as u64)
+            .or_else(|| self.asks.first_key_value().map(|(tick, _)| *tick))
     }
 
     pub fn bids(&self) -> impl Iterator<Item = PriceLevel> + '_ {
@@ -250,7 +262,7 @@ impl LocalOrderBook {
             }
         }
         // Fallback to depth trees.
-        let tick = (price / self.tick_size).round() as u64;
+        let tick = (price / self.tick_size).floor() as u64;
         self.bids
             .get(&tick)
             .or_else(|| self.asks.get(&tick))
@@ -363,9 +375,10 @@ impl LocalOrderBook {
         for ask in &update.asks {
             store(&mut self.asks, ask, update.source, update.exch_ts, update.local_ts, delay_ns, self.tick_size);
         }
-    
+        
+        let elapsed = start.elapsed().as_nanos();
         self.timing_log.borrow_mut().push(TimingRecord {
-            elapsed_ns: start.elapsed().as_nanos(),
+            elapsed_ns: elapsed,
             exch_ts: update.exch_ts,
             local_ts: update.local_ts,
             bids: update.bids.len() as u32,
@@ -455,29 +468,32 @@ impl LocalOrderBook {
         let delay_ms = (self.last_local_ts - self.last_exch_ts) / 1_000_000;
 
         let asks = self.asks.iter();
+        let best_tick = self.best_ask_tick();
+
         let mut print_lines: Vec<String> = Vec::new();
         if self.last_update_source == Some(StreamSource::BookTicker) {
             // Push BBO first so it lands last after .rev() (bottom of asks display).
             if let Some(bbo) = self.bbo_ask {
                 print_lines.push(format!(
-                    "  {:.10} @ {:.1}  data_age={}ms, last_source=book_ticker",
+                    "  {:.10} @ {:.10} delay={}ms, last_source=book_ticker",
                     bbo.qty, bbo.price, delay_ms,
                 ));
             }
 
-            let best_price = self.bbo_ask.map(|a| a.price);
             for (_tick, meta) in asks {
                 if print_lines.len() > depth.unwrap_or(usize::MAX)-1 { break; }
                 let price = *_tick as f64 * self.tick_size;
-                if Some(price) > best_price {
-                    print_lines.push(format!("  {:.10} @ {:.1}  data_age={}ms, last_source={}", meta.qty, price, (self.last_local_ts - meta.last_exch_ts) / 1_000_000, meta.source));
+                if Some(_tick) > best_tick.as_ref() {
+                    print_lines.push(format!("  {:.10} @ {:.10}  data_age={}ms, delay={}ms, last_source={}", meta.qty, price, (self.last_local_ts - meta.last_local_ts) / 1_000_000, meta.delay_ns / 1_000_000, meta.source));
                 }
             }
         } else {
             for (_tick, meta) in asks {
                 if print_lines.len() > depth.unwrap_or(usize::MAX)-1 { break; }
                 let price = *_tick as f64 * self.tick_size;
-                print_lines.push(format!("  {:.10} @ {:.1}  data_age={}ms, last_source={}", meta.qty, price, (self.last_local_ts - meta.last_exch_ts) / 1_000_000, meta.source));
+                if Some(_tick) > best_tick.as_ref() {
+                    print_lines.push(format!("  {:.10} @ {:.10}  data_age={}ms, delay={}ms, last_source={}", meta.qty, price, (self.last_local_ts - meta.last_local_ts) / 1_000_000, meta.delay_ns / 1_000_000, meta.source));
+                }
             }
         }
         for line in print_lines.iter().rev() {
@@ -492,20 +508,21 @@ impl LocalOrderBook {
         let mut print_counter: usize = 0;
 
         let bids = self.bids.iter().rev();
+        let best_tick = self.best_bid_tick();
         if self.last_update_source == Some(StreamSource::BookTicker) {
             if let Some(bbo) = self.bbo_bid {
                 writeln!(
                     f,
-                    "  {:.10} @ {:.1}  data_age={}ms, last_source=book_ticker",
+                    "  {:.10} @ {:.10}  delay={}ms, last_source=book_ticker",
                     bbo.qty, bbo.price, delay_ms,
                 )?;
             }
-            let best_price = self.bbo_bid.map(|b| b.price);
+
             for (_tick, meta) in bids {
                 if print_counter > depth.unwrap_or(usize::MAX)-1 { break; }
                 let price = *_tick as f64 * self.tick_size;
-                if Some(price) < best_price {
-                    writeln!(f, "  {:.10} @ {:.1}  data_age={}ms, last_source={}", meta.qty, price, (self.last_local_ts - meta.last_exch_ts) / 1_000_000, meta.source)?;
+                if Some(_tick) < best_tick.as_ref() {
+                    writeln!(f, "  {:.10} @ {:.10}  data_age={}ms, delay={}ms, last_source={}", meta.qty, price, (self.last_local_ts - meta.last_local_ts) / 1_000_000, meta.delay_ns / 1_000_000, meta.source)?;
                     print_counter += 1;
                 }
             }
@@ -513,8 +530,10 @@ impl LocalOrderBook {
             for (_tick, meta) in bids {
                 if print_counter > depth.unwrap_or(usize::MAX)-1 { break; }
                 let price = *_tick as f64 * self.tick_size;
-                writeln!(f, "  {:.10} @ {:.1}  data_age={}ms, last_source={}", meta.qty, price, (self.last_local_ts - meta.last_exch_ts) / 1_000_000, meta.source)?;
-                print_counter += 1;
+                if Some(_tick) <= best_tick.as_ref() {
+                    writeln!(f, "  {:.10} @ {:.10}  data_age={}ms, delay={}ms, last_source={}", meta.qty, price, (self.last_local_ts - meta.last_local_ts) / 1_000_000, meta.delay_ns / 1_000_000, meta.source)?;
+                    print_counter += 1;
+                }
             }
         }
         Ok(())
