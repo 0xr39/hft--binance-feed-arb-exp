@@ -8,21 +8,23 @@ use std::time::Instant;
 use tokio::sync::Mutex;
 use stream::{StreamConfig, StreamReceiver};
 
+const SYMBOL: &str = "BTCUSDT";
+
 async fn stream_to_book() {
     println!("=== hft--binance-feed-arb-exp  |  Async Stream Receiver ===\n");
 
     // Create a shared order book, initialised from a REST snapshot.
     let rest_base = stream::urls::REST_FAPI;
-    let snapshot_url = format!("{rest_base}?symbol=BTCUSDT&limit=1000");
+    let snapshot_url = format!("{rest_base}?symbol={SYMBOL}&limit=1000");
     let book = Arc::new(Mutex::new(
-        match book::LocalOrderBook::from_snapshot("BTCUSDT", 0.1, 0.001, &snapshot_url).await {
+        match book::LocalOrderBook::from_snapshot(SYMBOL, 0.1, 0.001, &snapshot_url).await {
             Ok(b) => {
                 println!("[snapshot] Initial snapshot applied");
                 b
             }
             Err(e) => {
                 eprintln!("[snapshot] Initial fetch failed: {e} — starting empty");
-                book::LocalOrderBook::new("BTCUSDT", 0.1, 0.001)
+                book::LocalOrderBook::new(SYMBOL, 0.1, 0.001)
             }
         },
     ));
@@ -30,20 +32,20 @@ async fn stream_to_book() {
 
     // Configure streams. 100ms and 250ms just wont be accepted together, but different depth level can coexist
     let streams_configs = vec![
-        StreamConfig::book_ticker("BTCUSDT"),
-        StreamConfig::partial_depth("BTCUSDT", 5, 100),
-        StreamConfig::partial_depth("BTCUSDT", 10, 100),
-        StreamConfig::partial_depth("BTCUSDT", 20, 100),
-        // StreamConfig::partial_depth("BTCUSDT", 20, 250),
-        StreamConfig::diff_depth("BTCUSDT", 100),
-        // StreamConfig::diff_depth("BTCUSDT", 250),
+        StreamConfig::book_ticker(SYMBOL),
+        StreamConfig::partial_depth(SYMBOL, 5, 100),
+        StreamConfig::partial_depth(SYMBOL, 10, 100),
+        StreamConfig::partial_depth(SYMBOL, 20, 100),
+        // StreamConfig::partial_depth(SYMBOL, 20, 250),
+        StreamConfig::diff_depth(SYMBOL, 100),
+        // StreamConfig::diff_depth(SYMBOL, 250),
     ];
 
     let mut receiver: StreamReceiver = StreamReceiver::new(
         book,
         streams_configs,
         rest_base.to_string(),
-        "BTCUSDT",
+        SYMBOL,
     );
 
     // Print book state every 5s, flush timing log every 5s.
@@ -67,21 +69,21 @@ async fn stream_to_book() {
 async fn stream_dry_run() {
     println!("=== hft--binance-feed-arb-exp  |  Async Stream Receiver (dry-run) ===\n");
 
-    let book = Arc::new(Mutex::new(book::LocalOrderBook::new("BTCUSDT", 0.1, 0.001)));
+    let book = Arc::new(Mutex::new(book::LocalOrderBook::new(SYMBOL, 0.1, 0.001)));
 
     let configs = vec![
-        StreamConfig::book_ticker("BTCUSDT"),
-        StreamConfig::partial_depth("BTCUSDT", 20, 100),
-        StreamConfig::partial_depth("BTCUSDT", 20, 250),
-        StreamConfig::diff_depth("BTCUSDT", 100),
-        StreamConfig::diff_depth("BTCUSDT", 250),
+        StreamConfig::book_ticker(SYMBOL),
+        StreamConfig::partial_depth(SYMBOL, 20, 100),
+        StreamConfig::partial_depth(SYMBOL, 20, 250),
+        StreamConfig::diff_depth(SYMBOL, 100),
+        StreamConfig::diff_depth(SYMBOL, 250),
     ];
 
     let receiver = StreamReceiver::new(
         book,
         configs,
         stream::urls::REST_FAPI.to_string(),
-        "BTCUSDT",
+        SYMBOL,
     );
 
     receiver.dry_run().await;
@@ -89,7 +91,7 @@ async fn stream_dry_run() {
 
 fn mock_book() {
     // ── Create a book for BTCUSDT ──────────────────────────────────────
-    let mut book = book::LocalOrderBook::new("BTCUSDT", 0.01, 0.001);
+    let mut book = book::LocalOrderBook::new(SYMBOL, 0.01, 0.001);
 
     // ── 1. Initial snapshot from Partial Book Depth Stream ─────────────
     println!("[1] Snapshot  (source: partial_book_depth)");
