@@ -89,6 +89,9 @@ pub struct LocalOrderBook {
     last_exch_ts: i64,
     /// The local timestamp of the most recent update.
     last_local_ts: i64,
+    /// Exchange timestamp of the most recent snapshot (nanoseconds since epoch).
+    /// Used to discard stale diff events that arrive after a snapshot.
+    last_snapshot_ts: i64,
     /// Total number of updates applied since creation.
     update_count: u64,
 }
@@ -175,6 +178,7 @@ impl LocalOrderBook {
             last_update_source: None,
             last_exch_ts: 0,
             last_local_ts: 0,
+            last_snapshot_ts: 0,
             update_count: 0,
         }
     }
@@ -260,6 +264,14 @@ impl LocalOrderBook {
     pub fn apply(&mut self, update: &BookUpdate) {
         let start = Instant::now();
 
+        // ── Stale-diff guard ─────────────────────────────────────────────
+        // After a snapshot, discard any non-snapshot update whose exchange
+        // timestamp is not strictly newer than the snapshot. This prevents
+        // stale buffered diff events from corrupting the freshly-reset book.
+        if !update.is_snapshot && update.exch_ts <= self.last_snapshot_ts {
+            return;
+        }
+
         // ── BookTicker fast-path: update BBO cache only, skip BTreeMap ──
         // This is the hottest stream (~tens of ms between ticks), so we
         // avoid O(log n) BTreeMap operations entirely.
@@ -306,6 +318,9 @@ impl LocalOrderBook {
 
         // Snapshot: clear side(s) before inserting.
         if update.is_snapshot {
+            self.last_snapshot_ts = update.exch_ts;
+            self.bbo_bid = None;
+            self.bbo_ask = None;
             if !update.bids.is_empty() {
                 self.bids.clear();
             }
@@ -370,6 +385,7 @@ impl LocalOrderBook {
         self.bids.clear();
         self.asks.clear();
         self.last_update_source = None;
+        self.last_snapshot_ts = 0;
         self.timing_log.borrow_mut().clear();
     }
 
