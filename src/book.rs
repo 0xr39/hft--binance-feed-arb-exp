@@ -521,7 +521,7 @@ impl LocalOrderBook {
             for (_tick, meta) in asks {
                 if print_lines.len() > depth.unwrap_or(usize::MAX)-1 { break; }
                 let price = *_tick as f64 * self.tick_size;
-                if Some(_tick) > best_tick.as_ref() {
+                if Some(_tick) >= best_tick.as_ref() {
                     print_lines.push(format!("  {:.10} @ {:.10}  data_age={}ms, delay={}ms, last_source={}", meta.qty, price, (self.last_local_ts - meta.last_local_ts) / 1_000_000, meta.delay_ns / 1_000_000, meta.source));
                 }
             }
