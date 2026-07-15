@@ -532,7 +532,7 @@ impl StreamReceiver {
                 Err(e) => {
                     self.reconnect_attempt += 1;
                     let delay = Duration::from_secs(
-                        std::cmp::min(self.reconnect_attempt * 2, 30),
+                        std::cmp::min(self.reconnect_attempt * 2, 5),
                     );
                     eprintln!(
                         "[stream] Connect error: {e} — reconnecting in {delay:?}"

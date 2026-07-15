@@ -54,11 +54,11 @@ async fn stream_to_book() {
 
     receiver
         .run(Box::new(move |book| {
-            if last_flush.elapsed().as_secs() >= 10 {
+            if last_flush.elapsed().as_secs() >= 5 {
                 book.flush_timing_log();
                 last_flush = Instant::now();
             }
-            if last_print.elapsed().as_secs() >= 10 {
+            if last_print.elapsed().as_secs() >= 5 {
                 println!("{:.10}", book);
                 last_print = Instant::now();
             }
@@ -109,7 +109,7 @@ fn mock_book() {
             book::PriceLevel::new(96352.0, 3.200),
             book::PriceLevel::new(96355.0, 1.000),
         ],
-        is_snapshot: true,
+        is_snapshot: false,
     });
     println!("  Best bid: {:?}", book.best_bid());
     println!("  Best ask: {:?}", book.best_ask());
