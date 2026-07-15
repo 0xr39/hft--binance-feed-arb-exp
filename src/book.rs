@@ -402,18 +402,17 @@ impl LocalOrderBook {
 // ---------------------------------------------------------------------------
 
 impl LocalOrderBook {
-    /// Write all ask levels with delay info to a formatter.
-    /// When the last update was `BookTicker`, prints the BBO ask inline
-    /// and skips the matching level in the tree (no eager cleanup needed).
-    fn log_write_asks(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    /// Write ask levels with delay info to a formatter, up to `depth` levels.
+    fn log_write_asks(&self, f: &mut std::fmt::Formatter<'_>, depth: Option<usize>) -> std::fmt::Result {
         let delay_ms = (self.last_local_ts - self.last_exch_ts) / 1_000_000;
 
+        let asks = self.asks.iter().take(depth.unwrap_or(usize::MAX)).rev();
         if self.last_update_source == Some(StreamSource::BookTicker) {
             // BBO ask as a regular depth line at the top.
             let best_price = self.bbo_ask.map(|a| a.price);
-            for (_tick, meta) in self.asks.iter().rev() {
+
+            for (_tick, meta) in asks {
                 let price = *_tick as f64 * self.tick_size;
-                // Skip the BBO level — already printed above.
                 if Some(price) > best_price {
                     writeln!(f, "  {:.10} @ {:.1}  data_age={}ms, last_source={}", meta.qty, price, (self.last_local_ts - meta.last_exch_ts) / 1_000_000, meta.source)?;
                 }
@@ -426,8 +425,7 @@ impl LocalOrderBook {
                 )?;
             }
         } else {
-            // Full depth view, no filter.
-            for (_tick, meta) in self.asks.iter().rev() {
+            for (_tick, meta) in asks {
                 let price = *_tick as f64 * self.tick_size;
                 writeln!(f, "  {:.10} @ {:.1}  data_age={}ms, last_source={}", meta.qty, price, (self.last_local_ts - meta.last_exch_ts) / 1_000_000, meta.source)?;
             }
@@ -435,14 +433,12 @@ impl LocalOrderBook {
         Ok(())
     }
 
-    /// Write all bid levels with delay info to a formatter.
-    /// When the last update was `BookTicker`, prints the BBO bid inline
-    /// and skips the matching level in the tree.
-    fn log_write_bids(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    /// Write bid levels with delay info to a formatter, up to `depth` levels.
+    fn log_write_bids(&self, f: &mut std::fmt::Formatter<'_>, depth: Option<usize>) -> std::fmt::Result {
         let delay_ms = (self.last_local_ts - self.last_exch_ts) / 1_000_000;
 
+        let bids = self.bids.iter().rev().take(depth.unwrap_or(usize::MAX));
         if self.last_update_source == Some(StreamSource::BookTicker) {
-            // BBO bid as a regular depth line at the top.
             if let Some(bbo) = self.bbo_bid {
                 writeln!(
                     f,
@@ -451,16 +447,14 @@ impl LocalOrderBook {
                 )?;
             }
             let best_price = self.bbo_bid.map(|b| b.price);
-            for (_tick, meta) in self.bids.iter().rev() {
+            for (_tick, meta) in bids {
                 let price = *_tick as f64 * self.tick_size;
-                // Skip the BBO level — already printed above.
                 if Some(price) < best_price {
                     writeln!(f, "  {:.10} @ {:.1}  data_age={}ms, last_source={}", meta.qty, price, (self.last_local_ts - meta.last_exch_ts) / 1_000_000, meta.source)?;
                 }
             }
         } else {
-            // Full depth view, no filter.
-            for (_tick, meta) in self.bids.iter().rev() {
+            for (_tick, meta) in bids {
                 let price = *_tick as f64 * self.tick_size;
                 writeln!(f, "  {:.10} @ {:.1}  data_age={}ms, last_source={}", meta.qty, price, (self.last_local_ts - meta.last_exch_ts) / 1_000_000, meta.source)?;
             }
@@ -499,10 +493,10 @@ impl std::fmt::Display for LocalOrderBook {
             writeln!(f, "  Last update: {src} ({})", self.update_count())?;
         }
         // All asks (printed first)
-        self.log_write_asks(f)?;
+        self.log_write_asks(f, f.precision())?;
         writeln!(f, "  ───────")?;
         // All bids
-        self.log_write_bids(f)?;
+        self.log_write_bids(f, f.precision())?;
         Ok(())
     }
 }

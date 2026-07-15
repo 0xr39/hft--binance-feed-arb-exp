@@ -30,8 +30,8 @@ async fn stream_to_book() {
                 book.flush_timing_log();
                 last_flush = Instant::now();
             }
-            if last_print.elapsed().as_secs() >= 20 {
-                println!("{book}");
+            if last_print.elapsed().as_secs() >= 5 {
+                println!("{:.10}",book);
                 last_print = Instant::now();
             }
         }))
