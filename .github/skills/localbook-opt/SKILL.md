@@ -202,6 +202,50 @@ bookTicker `apply()` drops from ~542 ns → **~20-50 ns** (a few field assignmen
 
 ---
 
+## Order Book Cleanup Strategy — Lazy vs Eager
+
+For BBO-driven fusion, the common hot path is:
+
+```
+BBO update -> read top 10 levels
+```
+
+There are two strategies for cleaning stale / crossed levels after a `bookTicker` BBO update:
+
+| Strategy | Update cost | Read top 10 cost | Total per update + read cycle | Tradeoff |
+|---|---|---|---|---|
+| **Eager cleanup** | `O(log n + k)` | `O(10)` | `O(log n + k + 10)` | More predictable reads, but every BBO update pays cleanup cost immediately |
+| **Lazy filtering** | `O(1)` | `O(10 + k)` | `O(11 + k)` | Very cheap BBO updates, with possible small spikes when reading if invalid levels must be skipped |
+
+Where:
+- `n` = number of levels stored in the local book
+- `k` = number of stale / invalid levels that would be cleaned or skipped
+
+**Recommendation: use lazy filtering for now.**
+
+Rationale:
+- `bookTicker` BBO updates are expected to be very frequent.
+- Keeping the BBO update path close to `O(1)` is valuable for high-frequency ingestion.
+- The extra read-time filtering cost, `O(k)`, should usually be small when reading only the top 10 levels.
+- If read-time spikes become measurable later, add periodic compaction or switch specific paths to eager cleanup.
+
+Implementation direction:
+
+```rust
+// On bookTicker / BBO update:
+self.best_bid = Some(new_best_bid);
+self.best_ask = Some(new_best_ask);
+
+// Insert or update the BBO levels, but do not immediately clean all stale levels.
+self.bids.insert(new_best_bid_ticks, bid_meta);
+self.asks.insert(new_best_ask_ticks, ask_meta);
+
+// On top-N read:
+// Iterate from best outward and skip levels that are invalid relative to cached BBO.
+```
+
+---
+
 ## Future Optimization Ideas
 
 ### Parallelize bids and asks with `rayon::join`
