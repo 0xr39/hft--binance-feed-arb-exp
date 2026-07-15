@@ -379,8 +379,10 @@ impl LocalOrderBook {
     /// Delegates to `apply()`, which handles BBO cache clearing,
     /// `last_snapshot_ts` watermark, and level insertion.
     pub fn apply_snapshot(&mut self, update: &BookUpdate) {
+        // eprintln!("[apply_snapshot] applying snapshot, last_snapshot_ts={}  |  last_exch_ts={}", self.last_snapshot_ts, self.last_exch_ts);
         assert!(update.is_snapshot, "apply_snapshot requires is_snapshot=true");
         self.apply(update);
+        // eprintln!("[apply_snapshot] applied snapshot, last_snapshot_ts={}  |  last_exch_ts={}", self.last_snapshot_ts, self.last_exch_ts);
     }
 
     /// Create a book pre-populated from a REST depth snapshot.

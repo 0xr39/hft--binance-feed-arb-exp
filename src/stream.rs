@@ -383,7 +383,7 @@ impl StreamReceiver {
             rest_url,
             symbol: symbol.into(),
             snapshot_limit: 1000,
-            snapshot_interval: Duration::from_secs(30),
+            snapshot_interval: Duration::from_secs(60),
         }
     }
 
@@ -532,7 +532,7 @@ impl StreamReceiver {
                 Err(e) => {
                     self.reconnect_attempt += 1;
                     let delay = Duration::from_secs(
-                        std::cmp::min(self.reconnect_attempt * 2, 30),
+                        std::cmp::min(self.reconnect_attempt * 2, 5),
                     );
                     eprintln!(
                         "[stream] Connect error: {e} — reconnecting in {delay:?}"
