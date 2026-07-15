@@ -1,13 +1,16 @@
 use crate::util;
 
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt;
 use serde::Deserialize;
+use tokio::sync::Mutex;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::book::{BookUpdate, LocalOrderBook, PriceLevel};
+pub(crate) use crate::util::parse_levels;
 
 // ---------------------------------------------------------------------------
 // Stream source identification
@@ -26,6 +29,9 @@ pub enum StreamSource {
     /// ## Diff. Book Depth Stream (`<symbol>@depth@<speed>ms`)
     /// Incremental delta updates: which price levels changed and how.
     DiffBookDepth { speed_ms: u32 },
+    /// ## REST Depth Snapshot (`GET /fapi/v1/depth` or `GET /api/v3/depth`)
+    /// Periodic HTTP snapshot for book resync.
+    Snapshot,
     /// Placeholder for newly discovered streams added later.
     Other(&'static str),
 }
@@ -41,6 +47,7 @@ impl std::fmt::Display for StreamSource {
             Self::DiffBookDepth { speed_ms } => {
                 write!(f, "diff_book_depth@{speed_ms}ms")
             }
+            Self::Snapshot => write!(f, "snapshot"),
             Self::Other(name) => write!(f, "other({name})"),
         }
     }
@@ -80,6 +87,7 @@ impl StreamConfig {
                 let speed = self.speed_ms.unwrap_or(100);
                 format!("{symbol}@depth{levels}@{speed}ms")
             }
+            StreamSource::Snapshot => String::from("snapshot"),
             StreamSource::Other(name) => name.to_string(),
         }
     }
@@ -177,6 +185,8 @@ struct PartialDepthEvent {
     asks: Vec<[String; 2]>,
 }
 
+/// REST depth snapshot response from Binance (`GET /fapi/v1/depth` or `GET /api/v3/depth`).
+///
 // ---------------------------------------------------------------------------
 // Stream error
 // ---------------------------------------------------------------------------
@@ -222,17 +232,6 @@ impl From<serde_json::Error> for StreamError {
 // ---------------------------------------------------------------------------
 // Parse helpers
 // ---------------------------------------------------------------------------
-
-/// Convert `[price_str, qty_str]` pairs into `PriceLevel`s.
-fn parse_levels(pairs: &[[String; 2]]) -> Vec<PriceLevel> {
-    pairs
-        .iter()
-        .map(|[p, q]| PriceLevel::new(
-            p.parse().unwrap_or(0.0),
-            q.parse().unwrap_or(0.0),
-        ))
-        .collect()
-}
 
 /// Identify the stream source from a Binance combined-stream name, extracting
 /// levels and speed parameters.
@@ -311,6 +310,10 @@ fn parse_book_update(text: &str, local_ts: i64) -> Result<BookUpdate, StreamErro
                 is_snapshot: false,
             })
         }
+        StreamSource::Snapshot => {
+            // Snapshot variant is only used by REST fetch, never by WS parsing.
+            Err(StreamError::UnknownStream("snapshot".to_string()))
+        }
         StreamSource::Other(_) => Err(StreamError::UnknownStream(payload.stream))
     }
 }
@@ -324,6 +327,10 @@ pub mod urls {
     pub const WS_A: &str = "wss://stream.binance.com:9443/stream";
     pub const WS_B: &str = "wss://fstream.binance.com/public/stream";
     pub const WS_C: &str = "wss://stream.binancefuture.com/public/stream";
+
+    /// Futures REST depth endpoint.
+    pub const REST_FAPI: &str = "https://fapi.binance.com/fapi/v1/depth";
+
 }
 
 // ---------------------------------------------------------------------------
@@ -345,28 +352,38 @@ pub mod urls {
 /// On disconnect, the receiver automatically reconnects with exponential
 /// backoff.
 pub struct StreamReceiver {
-    /// Internal order book being maintained.
-    book: LocalOrderBook,
+    /// Shared order book — accessed by WS loop (lock) and snapshot task (try_lock).
+    book: Arc<Mutex<LocalOrderBook>>,
     /// Stream subscription configurations.
     configs: Vec<StreamConfig>,
     /// Total reconnection attempts (used for backoff).
     reconnect_attempt: u64,
+    /// REST base URL for snapshot fetch (e.g. `https://fapi.binance.com/fapi/v1/depth`).
+    rest_url: String,
+    /// Trading pair symbol, e.g. `"BTCUSDT"`.
+    symbol: String,
+    /// Number of depth levels to request from REST.
+    snapshot_limit: u32,
+    /// How often to refresh the snapshot.
+    snapshot_interval: Duration,
 }
 
 impl StreamReceiver {
-    /// Create a new `StreamReceiver` for the given symbol and stream configs.
-    ///
-    /// `tick_size` and `lot_size` are forwarded to [`LocalOrderBook::new`].
+    /// Create a new `StreamReceiver` that owns a shared order book.
     pub fn new(
-        symbol: impl Into<String>,
-        tick_size: f64,
-        lot_size: f64,
+        book: Arc<Mutex<LocalOrderBook>>,
         configs: Vec<StreamConfig>,
+        rest_url: String,
+        symbol: impl Into<String>,
     ) -> Self {
         Self {
-            book: LocalOrderBook::new(symbol, tick_size, lot_size),
+            book,
             configs,
             reconnect_attempt: 0,
+            rest_url,
+            symbol: symbol.into(),
+            snapshot_limit: 1000,
+            snapshot_interval: Duration::from_secs(30),
         }
     }
 
@@ -374,14 +391,9 @@ impl StreamReceiver {
     // Public accessors
     // -----------------------------------------------------------------------
 
-    /// Immutable reference to the internal order book.
-    pub fn book(&self) -> &LocalOrderBook {
-        &self.book
-    }
-
-    /// Mutable reference to the internal order book.
-    pub fn book_mut(&mut self) -> &mut LocalOrderBook {
-        &mut self.book
+    /// Lock the book and return a guard (synchronous, for non-async contexts).
+    pub fn book(&self) -> tokio::sync::MutexGuard<'_, LocalOrderBook> {
+        self.book.blocking_lock()
     }
 
     // -----------------------------------------------------------------------
@@ -478,15 +490,43 @@ impl StreamReceiver {
     /// combined-streams endpoint and reconnecting on failure with exponential
     /// backoff capped at 30 seconds.
     ///
+    /// A background task periodically fetches a REST depth snapshot and
+    /// silently corrects the book (no `on_update` call for snapshots).
+    ///
     /// The `on_update` callback is invoked after every successfully parsed
-    /// and applied book update.
+    /// and applied WebSocket update. The book is held locked for the duration
+    /// of the callback.
     pub async fn run(&mut self, mut on_update: Box<dyn FnMut(&LocalOrderBook) + Send>) {
         let _ = rustls::crypto::ring::default_provider().install_default();
+
+        // ── Spawn background snapshot loop ──────────────────────────────
+        let snapshot_book = self.book.clone();
+        let full_rest_url = format!(
+            "{}?symbol={}&limit={}",
+            self.rest_url, self.symbol, self.snapshot_limit,
+        );
+        let interval = self.snapshot_interval;
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                match crate::book::fetch_depth_snapshot(&full_rest_url).await {
+                    Ok(update) => {
+                        // try_lock — never block the WS loop.
+                        if let Ok(mut guard) = snapshot_book.try_lock() {
+                            guard.apply_snapshot(&update);
+                        }
+                    }
+                    Err(e) => eprintln!("[snapshot] refresh error: {e}"),
+                }
+            }
+        });
+
+        // ── WS message loop with reconnection ───────────────────────────
         loop {
             let url = self.build_ws_url();
             eprintln!("[stream] Connecting to {url}");
 
-            // ── Connect ────────────────────────────────────────────────────
+            // ── Connect ────────────────────────────────────────────────
             let (ws, _) = match connect_async(&url).await {
                 Ok(conn) => conn,
                 Err(e) => {
@@ -505,17 +545,18 @@ impl StreamReceiver {
             let (_, mut read) = ws.split();
             let mut clean_close = false;
 
-            // ── Message loop ───────────────────────────────────────────────
+            // ── Message loop ───────────────────────────────────────────
             while let Some(msg) = read.next().await {
                 match msg {
                     Ok(Message::Text(text)) => {
                         match parse_book_update(&text, util::now_nanos()) {
                             Ok(update) => {
-                                self.book.apply(&update);
-                                on_update(&self.book);
+                                let mut guard = self.book.lock().await;
+                                guard.apply(&update);
+                                on_update(&guard);
                             }
                             Err(StreamError::UnknownStream(_)) => {
-                                // Silently skip unrecognised stream payloads
+                                eprintln!("[stream] Unknown stream: {}", text);
                             }
                             Err(e) => {
                                 eprintln!("[stream] Parse error: {e}");
@@ -538,7 +579,7 @@ impl StreamReceiver {
                 }
             }
 
-            // ── Reconnect logic ────────────────────────────────────────────
+            // ── Reconnect logic ────────────────────────────────────────
             if clean_close {
                 self.reconnect_attempt = 0;
                 tokio::time::sleep(Duration::from_millis(100)).await;

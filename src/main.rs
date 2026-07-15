@@ -2,36 +2,58 @@ mod book;
 mod stream;
 mod util;
 
+use std::sync::Arc;
 use std::time::Instant;
 
+use tokio::sync::Mutex;
 use stream::{StreamConfig, StreamReceiver};
 
 async fn stream_to_book() {
     println!("=== hft--binance-feed-arb-exp  |  Async Stream Receiver ===\n");
 
-    // Configure all four streams for a single combined WebSocket connection.
-    let configs = vec![
+    // Create a shared order book, initialised from a REST snapshot.
+    let rest_base = stream::urls::REST_FAPI;
+    let snapshot_url = format!("{rest_base}?symbol=BTCUSDT&limit=1000");
+    let book = Arc::new(Mutex::new(
+        match book::LocalOrderBook::from_snapshot("BTCUSDT", 0.1, 0.001, &snapshot_url).await {
+            Ok(b) => {
+                println!("[snapshot] Initial snapshot applied");
+                b
+            }
+            Err(e) => {
+                eprintln!("[snapshot] Initial fetch failed: {e} — starting empty");
+                book::LocalOrderBook::new("BTCUSDT", 0.1, 0.001)
+            }
+        },
+    ));
+    println!("{:.10}", book.lock().await);
+
+    // Configure streams.
+    let streams_configs = vec![
         StreamConfig::book_ticker("BTCUSDT"),
         StreamConfig::partial_depth("BTCUSDT", 20, 100),
-        // StreamConfig::partial_depth("BTCUSDT", 20, 250),
         StreamConfig::diff_depth("BTCUSDT", 100),
-        // StreamConfig::diff_depth("BTCUSDT", 250),
     ];
 
-    let mut receiver: StreamReceiver = StreamReceiver::new("BTCUSDT", 0.1, 0.001, configs);
+    let mut receiver: StreamReceiver = StreamReceiver::new(
+        book,
+        streams_configs,
+        rest_base.to_string(),
+        "BTCUSDT",
+    );
 
-    // Print book state every x seconds, flush timing log every x seconds.
+    // Print book state every 5s, flush timing log every 5s.
     let mut last_print = Instant::now();
     let mut last_flush = Instant::now();
 
     receiver
         .run(Box::new(move |book| {
-            if last_flush.elapsed().as_secs() >= 5 {
+            if last_flush.elapsed().as_secs() >= 10 {
                 book.flush_timing_log();
                 last_flush = Instant::now();
             }
-            if last_print.elapsed().as_secs() >= 5 {
-                println!("{:.10}",book);
+            if last_print.elapsed().as_secs() >= 10 {
+                println!("{:.10}", book);
                 last_print = Instant::now();
             }
         }))
@@ -41,7 +63,8 @@ async fn stream_to_book() {
 async fn stream_dry_run() {
     println!("=== hft--binance-feed-arb-exp  |  Async Stream Receiver (dry-run) ===\n");
 
-    // Configure all four streams for a single combined WebSocket connection.
+    let book = Arc::new(Mutex::new(book::LocalOrderBook::new("BTCUSDT", 0.1, 0.001)));
+
     let configs = vec![
         StreamConfig::book_ticker("BTCUSDT"),
         StreamConfig::partial_depth("BTCUSDT", 20, 100),
@@ -50,7 +73,12 @@ async fn stream_dry_run() {
         StreamConfig::diff_depth("BTCUSDT", 250),
     ];
 
-    let mut receiver = StreamReceiver::new("BTCUSDT", 0.1, 0.001, configs);
+    let receiver = StreamReceiver::new(
+        book,
+        configs,
+        stream::urls::REST_FAPI.to_string(),
+        "BTCUSDT",
+    );
 
     receiver.dry_run().await;
 }

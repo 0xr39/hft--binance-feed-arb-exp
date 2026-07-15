@@ -4,6 +4,10 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 
 use rayon::join;
+use serde::Deserialize;
+
+use crate::util;
+use crate::util::parse_levels;
 
 pub use crate::stream::StreamSource;
 
@@ -100,6 +104,8 @@ pub struct LocalOrderBook {
 #[derive(Debug, Clone, Copy)]
 pub struct TimingRecord {
     pub elapsed_ns: u128,
+    pub exch_ts: i64,
+    pub local_ts: i64,
     pub bids: u32,
     pub asks: u32,
     pub source: StreamSource,
@@ -298,6 +304,8 @@ impl LocalOrderBook {
                 bids: update.bids.len() as u32,
                 asks: update.asks.len() as u32,
                 source: update.source,
+                exch_ts: update.exch_ts,
+                local_ts: update.local_ts,
             });
             return;
         }
@@ -358,10 +366,34 @@ impl LocalOrderBook {
         
         self.timing_log.borrow_mut().push(TimingRecord {
             elapsed_ns: start.elapsed().as_nanos(),
+            exch_ts: update.exch_ts,
+            local_ts: update.local_ts,
             bids: update.bids.len() as u32,
             asks: update.asks.len() as u32,
             source: update.source,
         });
+    }
+
+    /// Apply a snapshot `BookUpdate` to this book.
+    ///
+    /// Delegates to `apply()`, which handles BBO cache clearing,
+    /// `last_snapshot_ts` watermark, and level insertion.
+    pub fn apply_snapshot(&mut self, update: &BookUpdate) {
+        assert!(update.is_snapshot, "apply_snapshot requires is_snapshot=true");
+        self.apply(update);
+    }
+
+    /// Create a book pre-populated from a REST depth snapshot.
+    pub async fn from_snapshot(
+        symbol: impl Into<String>,
+        tick_size: f64,
+        lot_size: f64,
+        full_url: &str,
+    ) -> Result<Self, SnapshotError> {
+        let update = fetch_depth_snapshot(full_url).await?;
+        let mut book = Self::new(symbol, tick_size, lot_size);
+        book.apply_snapshot(&update);
+        Ok(book)
     }
 
     // -----------------------------------------------------------------------
@@ -402,8 +434,8 @@ impl LocalOrderBook {
             use std::fmt::Write;
             let _ = write!(
                 buf,
-                "[apply] {:>6} ns  |  {} bids, {} asks  |  source={}\n",
-                rec.elapsed_ns, rec.bids, rec.asks, rec.source,
+                "[apply] {:>6} ns  |  {} bids, {} asks  |  source={} | delay={} ms \n",
+                rec.elapsed_ns, rec.bids, rec.asks, rec.source, (rec.local_ts - rec.exch_ts) / 1_000_000
             );
         }
         eprintln!("{buf}");
@@ -419,16 +451,19 @@ impl LocalOrderBook {
     /// Write ask levels with delay info to a formatter, up to `depth` levels.
     fn log_write_asks(&self, f: &mut std::fmt::Formatter<'_>, depth: Option<usize>) -> std::fmt::Result {
         let delay_ms = (self.last_local_ts - self.last_exch_ts) / 1_000_000;
+        let mut print_counter: usize = 0;
 
-        let asks = self.asks.iter().take(depth.unwrap_or(usize::MAX)).rev();
+        let asks = self.asks.iter().take(usize::MAX).rev();
         if self.last_update_source == Some(StreamSource::BookTicker) {
             // BBO ask as a regular depth line at the top.
             let best_price = self.bbo_ask.map(|a| a.price);
 
             for (_tick, meta) in asks {
+                if print_counter > depth.unwrap_or(usize::MAX)-1 { break; }
                 let price = *_tick as f64 * self.tick_size;
                 if Some(price) > best_price {
                     writeln!(f, "  {:.10} @ {:.1}  data_age={}ms, last_source={}", meta.qty, price, (self.last_local_ts - meta.last_exch_ts) / 1_000_000, meta.source)?;
+                    print_counter += 1;
                 }
             }
             if let Some(bbo) = self.bbo_ask {
@@ -440,8 +475,10 @@ impl LocalOrderBook {
             }
         } else {
             for (_tick, meta) in asks {
+                if print_counter > depth.unwrap_or(usize::MAX)-1 { break; }
                 let price = *_tick as f64 * self.tick_size;
                 writeln!(f, "  {:.10} @ {:.1}  data_age={}ms, last_source={}", meta.qty, price, (self.last_local_ts - meta.last_exch_ts) / 1_000_000, meta.source)?;
+                print_counter += 1;
             }
         }
         Ok(())
@@ -450,8 +487,9 @@ impl LocalOrderBook {
     /// Write bid levels with delay info to a formatter, up to `depth` levels.
     fn log_write_bids(&self, f: &mut std::fmt::Formatter<'_>, depth: Option<usize>) -> std::fmt::Result {
         let delay_ms = (self.last_local_ts - self.last_exch_ts) / 1_000_000;
+        let mut print_counter: usize = 0;
 
-        let bids = self.bids.iter().rev().take(depth.unwrap_or(usize::MAX));
+        let bids = self.bids.iter().rev().take(usize::MAX);
         if self.last_update_source == Some(StreamSource::BookTicker) {
             if let Some(bbo) = self.bbo_bid {
                 writeln!(
@@ -462,15 +500,19 @@ impl LocalOrderBook {
             }
             let best_price = self.bbo_bid.map(|b| b.price);
             for (_tick, meta) in bids {
+                if print_counter > depth.unwrap_or(usize::MAX)-1 { break; }
                 let price = *_tick as f64 * self.tick_size;
                 if Some(price) < best_price {
                     writeln!(f, "  {:.10} @ {:.1}  data_age={}ms, last_source={}", meta.qty, price, (self.last_local_ts - meta.last_exch_ts) / 1_000_000, meta.source)?;
+                    print_counter += 1;
                 }
             }
         } else {
             for (_tick, meta) in bids {
+                if print_counter > depth.unwrap_or(usize::MAX)-1 { break; }
                 let price = *_tick as f64 * self.tick_size;
                 writeln!(f, "  {:.10} @ {:.1}  data_age={}ms, last_source={}", meta.qty, price, (self.last_local_ts - meta.last_exch_ts) / 1_000_000, meta.source)?;
+                print_counter += 1;
             }
         }
         Ok(())
@@ -513,6 +555,71 @@ impl std::fmt::Display for LocalOrderBook {
         self.log_write_bids(f, f.precision())?;
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// REST snapshot types and fetch
+// ---------------------------------------------------------------------------
+
+/// REST depth snapshot response from Binance (`GET /fapi/v1/depth` or `GET /api/v3/depth`).
+#[derive(Deserialize)]
+struct RestDepthSnapshot {
+    #[serde(rename = "lastUpdateId")]
+    last_update_id: u64,
+    #[serde(rename = "T")]
+    transaction_time: i64,
+    bids: Vec<[String; 2]>,
+    asks: Vec<[String; 2]>,
+}
+
+/// Errors that can occur during REST snapshot fetch.
+#[derive(Debug)]
+pub enum SnapshotError {
+    /// HTTP request failure.
+    Http(String),
+    /// JSON parse failure.
+    Json(String),
+}
+
+impl std::fmt::Display for SnapshotError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Http(msg) => write!(f, "HTTP error: {msg}"),
+            Self::Json(msg) => write!(f, "JSON error: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for SnapshotError {}
+
+impl From<reqwest::Error> for SnapshotError {
+    fn from(e: reqwest::Error) -> Self {
+        Self::Http(e.to_string())
+    }
+}
+
+impl From<serde_json::Error> for SnapshotError {
+    fn from(e: serde_json::Error) -> Self {
+        Self::Json(e.to_string())
+    }
+}
+
+/// Fetch a REST depth snapshot from a pre-built URL and return a `BookUpdate`
+/// with `is_snapshot: true`.
+pub async fn fetch_depth_snapshot(full_url: &str) -> Result<BookUpdate, SnapshotError> {
+    let resp: RestDepthSnapshot = reqwest::get(full_url).await?.json().await?;
+
+    let local_ts = crate::util::now_nanos();
+    let exch_ts = resp.transaction_time * 1_000_000;
+
+    Ok(BookUpdate {
+        source: crate::stream::StreamSource::Snapshot,
+        exch_ts,
+        local_ts,
+        bids: parse_levels(&resp.bids),
+        asks: parse_levels(&resp.asks),
+        is_snapshot: true,
+    })
 }
 
 // ---------------------------------------------------------------------------
