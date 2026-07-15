@@ -106,7 +106,7 @@ cargo test
 
 ## Performance
 
-Typical `apply()` latency on live Binance streams (debug build, batched timing log):
+Typical `apply()` latency on live Binance streams (full steroid release build, batched timing log):
 
 | Source | Levels | Tick to Trade Latency |
 |--------|--------|---------|
