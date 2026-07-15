@@ -3,6 +3,8 @@ use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 use std::time::Instant;
 
+use rayon::join;
+
 pub use crate::stream::StreamSource;
 
 // ---------------------------------------------------------------------------
@@ -69,6 +71,11 @@ pub struct LocalOrderBook {
     pub lot_size: f64,
 
     // --- Book state -------------------------------------------------------
+    /// Cached best bid from BookTicker stream (fast BBO, avoids BTreeMap).
+    bbo_bid: Option<PriceLevel>,
+    /// Cached best ask from BookTicker stream (fast BBO, avoids BTreeMap).
+    bbo_ask: Option<PriceLevel>,
+    
     bids: BTreeMap<u64, LevelMeta>,   // price in ticks -> metadata
     asks: BTreeMap<u64, LevelMeta>,   // price in ticks -> metadata
 
@@ -109,6 +116,50 @@ struct LevelMeta {
     delay_ns: i64,
 }
 
+/// Insert, update, or remove a single level in one of the depth maps.
+///
+/// Standalone function (not a closure) so the compiler can inline it freely,
+/// and so it can be called from `rayon::join` closures without capturing `self`.
+fn store(
+    map: &mut BTreeMap<u64, LevelMeta>,
+    level: &PriceLevel,
+    source: StreamSource,
+    exch_ts: i64,
+    local_ts: i64,
+    delay_ns: i64,
+    tick_size: f64,
+) {
+    let tick = (level.price / tick_size).round() as u64;
+    match map.entry(tick) {
+        Entry::Vacant(entry) => {
+            if level.qty != 0.0 {
+                entry.insert(LevelMeta {
+                    qty: level.qty,
+                    source,
+                    last_exch_ts: exch_ts,
+                    last_local_ts: local_ts,
+                    delay_ns,
+                });
+            }
+        }
+        Entry::Occupied(mut entry) => {
+            if exch_ts > entry.get().last_exch_ts {
+                if level.qty == 0.0 {
+                    entry.remove();
+                } else {
+                    entry.insert(LevelMeta {
+                        qty: level.qty,
+                        source,
+                        last_exch_ts: exch_ts,
+                        last_local_ts: local_ts,
+                        delay_ns,
+                    });
+                }
+            }
+        }
+    }
+}
+
 impl LocalOrderBook {
     /// Create a new empty order book for `symbol`.
     pub fn new(symbol: impl Into<String>, tick_size: f64, lot_size: f64) -> Self {
@@ -116,6 +167,8 @@ impl LocalOrderBook {
             symbol: symbol.into(),
             tick_size,
             lot_size,
+            bbo_bid: None,
+            bbo_ask: None,
             bids: BTreeMap::new(),
             asks: BTreeMap::new(),
             timing_log: RefCell::new(Vec::with_capacity(256)),
@@ -131,16 +184,20 @@ impl LocalOrderBook {
     // -----------------------------------------------------------------------
 
     pub fn best_bid(&self) -> Option<PriceLevel> {
-        self.bids.last_key_value().map(|(tick, m)| PriceLevel {
-            price: *tick as f64 * self.tick_size,
-            qty: m.qty,
+        self.bbo_bid.or_else(|| {
+            self.bids.last_key_value().map(|(tick, m)| PriceLevel {
+                price: *tick as f64 * self.tick_size,
+                qty: m.qty,
+            })
         })
     }
 
     pub fn best_ask(&self) -> Option<PriceLevel> {
-        self.asks.first_key_value().map(|(tick, m)| PriceLevel {
-            price: *tick as f64 * self.tick_size,
-            qty: m.qty,
+        self.bbo_ask.or_else(|| {
+            self.asks.first_key_value().map(|(tick, m)| PriceLevel {
+                price: *tick as f64 * self.tick_size,
+                qty: m.qty,
+            })
         })
     }
 
@@ -169,7 +226,20 @@ impl LocalOrderBook {
     }
 
     /// Query which stream last updated a specific price level.
+    /// Checks the BBO cache first, then the depth trees.
     pub fn source_at_price(&self, price: f64) -> Option<StreamSource> {
+        // Check BBO cache first (no tick-rounding needed, exact match).
+        if let Some(bbo) = self.bbo_bid {
+            if bbo.price == price {
+                return Some(StreamSource::BookTicker);
+            }
+        }
+        if let Some(bbo) = self.bbo_ask {
+            if bbo.price == price {
+                return Some(StreamSource::BookTicker);
+            }
+        }
+        // Fallback to depth trees.
         let tick = (price / self.tick_size).round() as u64;
         self.bids
             .get(&tick)
@@ -190,69 +260,87 @@ impl LocalOrderBook {
     pub fn apply(&mut self, update: &BookUpdate) {
         let start = Instant::now();
 
+        // ── BookTicker fast-path: update BBO cache only, skip BTreeMap ──
+        // This is the hottest stream (~tens of ms between ticks), so we
+        // avoid O(log n) BTreeMap operations entirely.
+        if update.source == StreamSource::BookTicker {
+            // println!(
+            //     "[apply] BBO update: {} bids, {} asks | source={}",
+            //     update.bids.len(),
+            //     update.asks.len(),
+            //     update.source
+            // );
+            if let Some(bid) = update.bids.first() {
+                self.bbo_bid = Some(*bid);
+            }
+            if let Some(ask) = update.asks.first() {
+                self.bbo_ask = Some(*ask);
+            }
+            // No BTreeMap interaction — BBO cache only.
+            self.last_update_source = Some(update.source);
+            self.last_exch_ts = update.exch_ts;
+            self.last_local_ts = update.local_ts;
+            self.update_count += 1;
+            self.timing_log.borrow_mut().push(TimingRecord {
+                elapsed_ns: start.elapsed().as_nanos(),
+                bids: update.bids.len() as u32,
+                asks: update.asks.len() as u32,
+                source: update.source,
+            });
+            return;
+        }
+
+        // ── Depth updates (DiffBookDepth | PartialBookDepth) ───────────
+        // println!(
+        //     "[apply] depth update: {} bids, {} asks  |  source={}",
+        //     update.bids.len(),
+        //     update.asks.len(),
+        //     update.source
+        // );
         self.last_update_source = Some(update.source);
         self.last_exch_ts = update.exch_ts;
         self.last_local_ts = update.local_ts;
         self.update_count += 1;
 
-        // Wall-clock "now" for delay computation.
-        // let now_ns = crate::util::now_nanos();
         let delay_ns = update.local_ts - update.exch_ts;
 
-        let store = |map: &mut BTreeMap<u64, LevelMeta>,
-                     level: &PriceLevel,
-                     source: StreamSource,
-                     exch_ts: i64,
-                     local_ts: i64,
-                     dly_ns: i64| {
-            let tick = (level.price / self.tick_size).round() as u64;
-            // Single O(log n) lookup via Entry API — checks staleness and
-            // inserts/removes in one tree traversal.
-            match map.entry(tick) {
-                Entry::Vacant(entry) => {
-                    if level.qty != 0.0 {
-                        entry.insert(LevelMeta {
-                            qty: level.qty,
-                            source,
-                            last_exch_ts: exch_ts,
-                            last_local_ts: local_ts,
-                            delay_ns: dly_ns,
-                        });
-                    }
-                }
-                Entry::Occupied(mut entry) => {
-                    if exch_ts > entry.get().last_exch_ts {
-                        if level.qty == 0.0 {
-                            entry.remove();
-                        } else {
-                            entry.insert(LevelMeta {
-                                qty: level.qty,
-                                source,
-                                last_exch_ts: exch_ts,
-                                last_local_ts: local_ts,
-                                delay_ns: dly_ns,
-                            });
-                        }
-                    }
-                }
-            }
-        };
-
+        // Snapshot: clear side(s) before inserting.
         if update.is_snapshot {
-            // Replace entire side(s).
             if !update.bids.is_empty() {
                 self.bids.clear();
             }
             if !update.asks.is_empty() {
                 self.asks.clear();
             }
-        }
 
-        for bid in &update.bids {
-            store(&mut self.bids, bid, update.source, update.exch_ts, update.local_ts, delay_ns);
-        }
-        for ask in &update.asks {
-            store(&mut self.asks, ask, update.source, update.exch_ts, update.local_ts, delay_ns);
+            {
+                let tick_size = self.tick_size;
+                let source = update.source;
+                let exch_ts = update.exch_ts;
+                let local_ts = update.local_ts;
+                let (bids, asks) = (&mut self.bids, &mut self.asks);
+                join(
+                    || {
+                        for bid in &update.bids {
+                            store(bids, bid, source, exch_ts, local_ts, delay_ns, tick_size);
+                        }
+                    },
+                    || {
+                        for ask in &update.asks {
+                            store(asks, ask, source, exch_ts, local_ts, delay_ns, tick_size);
+                        }
+                    },
+                );
+            }
+        }else {
+            {
+                for bid in &update.bids {
+                    store(&mut self.bids, bid, update.source, update.exch_ts, update.local_ts, delay_ns, self.tick_size);
+                }
+                for ask in &update.asks {
+                    store(&mut self.asks, ask, update.source, update.exch_ts, update.local_ts, delay_ns, self.tick_size);
+                }
+            }
         }
 
         self.timing_log.borrow_mut().push(TimingRecord {
@@ -279,6 +367,8 @@ impl LocalOrderBook {
 
     /// Clear the entire book (e.g. before a reconnect + re-snapshot).
     pub fn clear(&mut self) {
+        self.bbo_bid = None;
+        self.bbo_ask = None;
         self.bids.clear();
         self.asks.clear();
         self.last_update_source = None;
@@ -289,6 +379,7 @@ impl LocalOrderBook {
     /// Call this periodically (e.g. every 5 seconds) from the stream callback.
     pub fn flush_timing_log(&self) {
         let mut log = self.timing_log.borrow_mut();
+        eprintln!("── Timing log ({} records) ──", log.len());
         if log.is_empty() {
             return;
         }
@@ -312,19 +403,67 @@ impl LocalOrderBook {
 
 impl LocalOrderBook {
     /// Write all ask levels with delay info to a formatter.
-    fn write_asks(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for (_tick, meta) in self.asks.iter() {
-            let price = *_tick as f64 * self.tick_size;
-            writeln!(f, "  {:.1} @ {:.1}  delay={}µs", meta.qty, price, meta.delay_ns / 1000)?;
+    /// When the last update was `BookTicker`, prints the BBO ask inline
+    /// and skips the matching level in the tree (no eager cleanup needed).
+    fn log_write_asks(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let delay_ms = (self.last_local_ts - self.last_exch_ts) / 1_000_000;
+
+        if self.last_update_source == Some(StreamSource::BookTicker) {
+            // BBO ask as a regular depth line at the top.
+            let best_price = self.bbo_ask.map(|a| a.price);
+            for (_tick, meta) in self.asks.iter().rev() {
+                let price = *_tick as f64 * self.tick_size;
+                // Skip the BBO level — already printed above.
+                if Some(price) > best_price {
+                    writeln!(f, "  {:.10} @ {:.1}  data_age={}ms, last_source={}", meta.qty, price, (self.last_local_ts - meta.last_exch_ts) / 1_000_000, meta.source)?;
+                }
+            }
+            if let Some(bbo) = self.bbo_ask {
+                writeln!(
+                    f,
+                    "  {:.10} @ {:.1}  data_age={}ms, last_source=book_ticker",
+                    bbo.qty, bbo.price, delay_ms,
+                )?;
+            }
+        } else {
+            // Full depth view, no filter.
+            for (_tick, meta) in self.asks.iter().rev() {
+                let price = *_tick as f64 * self.tick_size;
+                writeln!(f, "  {:.10} @ {:.1}  data_age={}ms, last_source={}", meta.qty, price, (self.last_local_ts - meta.last_exch_ts) / 1_000_000, meta.source)?;
+            }
         }
         Ok(())
     }
 
     /// Write all bid levels with delay info to a formatter.
-    fn write_bids(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        for (_tick, meta) in self.bids.iter().rev() {
-            let price = *_tick as f64 * self.tick_size;
-            writeln!(f, "  {:.1} @ {:.1}  delay={}µs", meta.qty, price, meta.delay_ns / 1000)?;
+    /// When the last update was `BookTicker`, prints the BBO bid inline
+    /// and skips the matching level in the tree.
+    fn log_write_bids(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let delay_ms = (self.last_local_ts - self.last_exch_ts) / 1_000_000;
+
+        if self.last_update_source == Some(StreamSource::BookTicker) {
+            // BBO bid as a regular depth line at the top.
+            if let Some(bbo) = self.bbo_bid {
+                writeln!(
+                    f,
+                    "  {:.10} @ {:.1}  data_age={}ms, last_source=book_ticker",
+                    bbo.qty, bbo.price, delay_ms,
+                )?;
+            }
+            let best_price = self.bbo_bid.map(|b| b.price);
+            for (_tick, meta) in self.bids.iter().rev() {
+                let price = *_tick as f64 * self.tick_size;
+                // Skip the BBO level — already printed above.
+                if Some(price) < best_price {
+                    writeln!(f, "  {:.10} @ {:.1}  data_age={}ms, last_source={}", meta.qty, price, (self.last_local_ts - meta.last_exch_ts) / 1_000_000, meta.source)?;
+                }
+            }
+        } else {
+            // Full depth view, no filter.
+            for (_tick, meta) in self.bids.iter().rev() {
+                let price = *_tick as f64 * self.tick_size;
+                writeln!(f, "  {:.10} @ {:.1}  data_age={}ms, last_source={}", meta.qty, price, (self.last_local_ts - meta.last_exch_ts) / 1_000_000, meta.source)?;
+            }
         }
         Ok(())
     }
@@ -333,20 +472,37 @@ impl LocalOrderBook {
 impl std::fmt::Display for LocalOrderBook {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "── {} ──", self.symbol)?;
+        // BBO cache (only shown when the last update was a BookTicker).
+        if self.last_update_source == Some(StreamSource::BookTicker) {
+            if let Some(bid) = self.bbo_bid {
+                writeln!(f, "  BBO bid: {:.1} @ {:.1}  (book_ticker)", bid.qty, bid.price)?;
+            }
+            if let Some(ask) = self.bbo_ask {
+                writeln!(f, "  BBO ask: {:.1} @ {:.1}  (book_ticker)", ask.qty, ask.price)?;
+            }
+        } else {
+            if let Some(bid) = self.best_bid() {
+                writeln!(f, "  BBO bid: {:.1} @ {:.1} ", bid.qty, bid.price)?;
+            }
+            if let Some(ask) = self.best_ask() {
+                writeln!(f, "  BBO ask: {:.1} @ {:.1} ", ask.qty, ask.price)?;
+            }
+        }
         writeln!(
             f,
-            "  Asks ({}) | Bids ({})",
+            "  Asks ({}) | Bids ({}), latest update: {}",
             self.ask_depth(),
-            self.bid_depth()
+            self.bid_depth(),
+            self.last_update_source.as_ref().map_or_else(|| "none".into(), |s| s.to_string())
         )?;
         if let Some(src) = self.last_source() {
             writeln!(f, "  Last update: {src} ({})", self.update_count())?;
         }
         // All asks (printed first)
-        self.write_asks(f)?;
+        self.log_write_asks(f)?;
         writeln!(f, "  ───────")?;
         // All bids
-        self.write_bids(f)?;
+        self.log_write_bids(f)?;
         Ok(())
     }
 }
@@ -365,7 +521,7 @@ mod tests {
 
         // Apply a snapshot
         let snap = BookUpdate {
-            source: StreamSource::PartialBookDepth,
+            source: StreamSource::PartialBookDepth { levels: 20, speed_ms: 100 },
             exch_ts: 1_000_000,
             local_ts: 1_000_001,
             bids: vec![PriceLevel::new(100.0, 1.0)],
@@ -378,7 +534,7 @@ mod tests {
 
         // A second snapshot replaces only the bid side.
         let snap2 = BookUpdate {
-            source: StreamSource::DiffBookDepth,
+            source: StreamSource::DiffBookDepth { speed_ms: 100 },
             exch_ts: 2_000_000,
             local_ts: 2_000_001,
             bids: vec![PriceLevel::new(99.0, 3.0)],
@@ -399,7 +555,7 @@ mod tests {
 
         // Seed with a snapshot
         book.apply(&BookUpdate {
-            source: StreamSource::PartialBookDepth,
+            source: StreamSource::PartialBookDepth { levels: 20, speed_ms: 100 },
             exch_ts: 1,
             local_ts: 1,
             bids: vec![PriceLevel::new(2000.0, 10.0)],
@@ -409,7 +565,7 @@ mod tests {
 
         // Diff: update bid qty, remove ask, add a new ask level
         book.apply(&BookUpdate {
-            source: StreamSource::DiffBookDepth,
+            source: StreamSource::DiffBookDepth { speed_ms: 100 },
             exch_ts: 2,
             local_ts: 2,
             bids: vec![PriceLevel::new(2000.0, 15.0)],

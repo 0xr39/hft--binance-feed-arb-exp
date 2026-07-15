@@ -19,13 +19,13 @@ pub enum StreamSource {
     /// ## Partial Book Depth Stream (`<symbol>@depth<levels>@<speed>ms`)
     /// e.g. `btcusdt@depth20@100ms`
     /// Periodic snapshots of the top N price levels.
-    PartialBookDepth,
+    PartialBookDepth { levels: u32, speed_ms: u32 },
     /// ## Individual Symbol Book Ticker Stream (`<symbol>@bookTicker`)
     /// Real-time BBO (best bid/ask) — fires on every quote change.
     BookTicker,
     /// ## Diff. Book Depth Stream (`<symbol>@depth@<speed>ms`)
     /// Incremental delta updates: which price levels changed and how.
-    DiffBookDepth,
+    DiffBookDepth { speed_ms: u32 },
     /// Placeholder for newly discovered streams added later.
     Other(&'static str),
 }
@@ -34,9 +34,13 @@ pub enum StreamSource {
 impl std::fmt::Display for StreamSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::PartialBookDepth => write!(f, "partial_book_depth"),
+            Self::PartialBookDepth { levels, speed_ms } => {
+                write!(f, "partial_book_depth<{levels}>@{speed_ms}ms")
+            }
             Self::BookTicker => write!(f, "book_ticker"),
-            Self::DiffBookDepth => write!(f, "diff_book_depth"),
+            Self::DiffBookDepth { speed_ms } => {
+                write!(f, "diff_book_depth@{speed_ms}ms")
+            }
             Self::Other(name) => write!(f, "other({name})"),
         }
     }
@@ -67,11 +71,11 @@ impl StreamConfig {
         let symbol = self.symbol.to_lowercase();
         match self.stream_type {
             StreamSource::BookTicker => format!("{symbol}@bookTicker"),
-            StreamSource::DiffBookDepth => {
+            StreamSource::DiffBookDepth { .. } => {
                 let speed = self.speed_ms.unwrap_or(100);
                 format!("{symbol}@depth@{speed}ms")
             }
-            StreamSource::PartialBookDepth => {
+            StreamSource::PartialBookDepth { .. } => {
                 let levels = self.levels.unwrap_or(20);
                 let speed = self.speed_ms.unwrap_or(100);
                 format!("{symbol}@depth{levels}@{speed}ms")
@@ -99,7 +103,7 @@ impl StreamConfig {
     /// Build a `StreamConfig` for `@depth<levels>@<speed>ms` (partial snapshot).
     pub fn partial_depth(symbol: impl Into<String>, levels: u32, speed_ms: u32) -> Self {
         Self {
-            stream_type: StreamSource::PartialBookDepth,
+            stream_type: StreamSource::PartialBookDepth { levels, speed_ms },
             symbol: symbol.into(),
             levels: Some(levels),
             speed_ms: Some(speed_ms),
@@ -109,7 +113,7 @@ impl StreamConfig {
     /// Build a `StreamConfig` for `@depth@<speed>ms` (diff book depth).
     pub fn diff_depth(symbol: impl Into<String>, speed_ms: u32) -> Self {
         Self {
-            stream_type: StreamSource::DiffBookDepth,
+            stream_type: StreamSource::DiffBookDepth { speed_ms },
             symbol: symbol.into(),
             levels: None,
             speed_ms: Some(speed_ms),
@@ -230,19 +234,33 @@ fn parse_levels(pairs: &[[String; 2]]) -> Vec<PriceLevel> {
         .collect()
 }
 
-/// Identify the stream source from a Binance combined-stream name.
+/// Identify the stream source from a Binance combined-stream name, extracting
+/// levels and speed parameters.
 ///
-/// The order of checks matters:
+/// Patterns:
 /// 1. `@bookTicker` → BookTicker
-/// 2. `@depth@` → DiffBookDepth  (e.g. `btcusdt@depth@100ms`)
-/// 3. `@depth` + digits → PartialBookDepth (e.g. `btcusdt@depth20@100ms`)
+/// 2. `@depth@<speed>ms` → DiffBookDepth { speed_ms }
+/// 3. `@depth<levels>@<speed>ms` → PartialBookDepth { levels, speed_ms }
 fn identify_source(stream_name: &str) -> Option<StreamSource> {
     if stream_name.contains("@bookTicker") {
-        Some(StreamSource::BookTicker)
-    } else if stream_name.contains("@depth@") {
-        Some(StreamSource::DiffBookDepth)
-    } else if stream_name.contains("@depth") {
-        Some(StreamSource::PartialBookDepth)
+        return Some(StreamSource::BookTicker);
+    }
+
+    if let Some(depth_pos) = stream_name.find("@depth") {
+        let after_depth = &stream_name[depth_pos + 6..]; // skip "@depth"
+
+        if after_depth.starts_with('@') {
+            // DiffBookDepth: @depth@100ms
+            let speed = after_depth[1..].trim_end_matches("ms").parse().ok()?;
+            Some(StreamSource::DiffBookDepth { speed_ms: speed })
+        } else {
+            // PartialBookDepth: @depth20@100ms
+            let end_of_levels = after_depth.find('@')?;
+            let levels: u32 = after_depth[..end_of_levels].parse().ok()?;
+            let speed_str = after_depth[end_of_levels + 1..].trim_end_matches("ms");
+            let speed: u32 = speed_str.parse().ok()?;
+            Some(StreamSource::PartialBookDepth { levels, speed_ms: speed })
+        }
     } else {
         None
     }
@@ -255,7 +273,7 @@ fn parse_book_update(text: &str, local_ts: i64) -> Result<BookUpdate, StreamErro
         .ok_or_else(|| StreamError::UnknownStream(payload.stream.clone()))?;
 
     match source {
-        StreamSource::BookTicker => {
+        StreamSource::BookTicker { .. } => {
             let ev: BookTickerEvent = serde_json::from_value(payload.data)?;
             let exch_ts = ev.transaction_time * 1_000_000;
             let bid_price: f64 = ev.best_bid_price.parse().unwrap_or(0.0);
@@ -271,7 +289,7 @@ fn parse_book_update(text: &str, local_ts: i64) -> Result<BookUpdate, StreamErro
                 is_snapshot: false,
             })
         }
-        StreamSource::DiffBookDepth => {
+        StreamSource::DiffBookDepth { .. } => {
             let ev: DiffDepthEvent = serde_json::from_value(payload.data)?;
             Ok(BookUpdate {
                 source,
@@ -282,7 +300,7 @@ fn parse_book_update(text: &str, local_ts: i64) -> Result<BookUpdate, StreamErro
                 is_snapshot: false,
             })
         }
-        StreamSource::PartialBookDepth => {
+        StreamSource::PartialBookDepth { .. } => {
             let ev: PartialDepthEvent = serde_json::from_value(payload.data)?;
             Ok(BookUpdate {
                 source,
@@ -293,7 +311,7 @@ fn parse_book_update(text: &str, local_ts: i64) -> Result<BookUpdate, StreamErro
                 is_snapshot: false,
             })
         }
-        StreamSource::Other(_) => Err(StreamError::UnknownStream(payload.stream)),
+        StreamSource::Other(_) => Err(StreamError::UnknownStream(payload.stream))
     }
 }
 
@@ -412,7 +430,7 @@ impl StreamReceiver {
                     Ok(Message::Text(text)) => {
                         match parse_book_update(&text, util::now_nanos()) {
                             Ok(update) => {
-                                // println!("[dry-run] {text}");
+                                println!("[dry-run] {text}");
                                 let bid_str = if update.bids.is_empty() {
                                     "no bids".into()
                                 } else {
@@ -426,9 +444,9 @@ impl StreamReceiver {
                                 let kind = if update.is_snapshot { "snapshot" } else { "diff" };
                                 eprintln!(
                                     "[dry-run] {}  {}  {}  {} delay: {} ms",
-                                    update.source, kind, bid_str, ask_str, (update.exch_ts - update.local_ts)/1_000_000 
+                                    update.source, kind, bid_str, ask_str, (update.local_ts - update.exch_ts)/1_000_000 
                                 );
-                                // eprintln!("[dry-run] exch_ts: {}, local_ts: {}", update.exch_ts, update.local_ts);
+                                eprintln!("[dry-run] exch_ts: {}, local_ts: {}", update.exch_ts, update.local_ts);
                             }
                             Err(StreamError::UnknownStream(_)) => {}
                             Err(e) => {
@@ -556,7 +574,7 @@ mod tests {
     fn identify_diff_depth() {
         assert_eq!(
             identify_source("btcusdt@depth@100ms"),
-            Some(StreamSource::DiffBookDepth),
+            Some(StreamSource::DiffBookDepth { speed_ms: 100 }),
         );
     }
 
@@ -564,11 +582,11 @@ mod tests {
     fn identify_partial_depth() {
         assert_eq!(
             identify_source("btcusdt@depth20@100ms"),
-            Some(StreamSource::PartialBookDepth),
+            Some(StreamSource::PartialBookDepth { levels: 20, speed_ms: 100 }),
         );
         assert_eq!(
             identify_source("btcusdt@depth20@250ms"),
-            Some(StreamSource::PartialBookDepth),
+            Some(StreamSource::PartialBookDepth { levels: 20, speed_ms: 250 }),
         );
     }
 
@@ -580,8 +598,8 @@ mod tests {
     #[test]
     fn display_partial_book_depth() {
         assert_eq!(
-            StreamSource::PartialBookDepth.to_string(),
-            "partial_book_depth",
+            StreamSource::PartialBookDepth { levels: 20, speed_ms: 100 }.to_string(),
+            "partial_book_depth<20>@100ms",
         );
     }
 
@@ -592,7 +610,10 @@ mod tests {
 
     #[test]
     fn display_diff_book_depth() {
-        assert_eq!(StreamSource::DiffBookDepth.to_string(), "diff_book_depth");
+        assert_eq!(
+            StreamSource::DiffBookDepth { speed_ms: 100 }.to_string(),
+            "diff_book_depth@100ms"
+        );
     }
 
     #[test]
@@ -662,7 +683,7 @@ mod tests {
         }"#;
 
         let update = parse_book_update(json, 0).unwrap();
-        assert_eq!(update.source, StreamSource::DiffBookDepth);
+        assert_eq!(update.source, StreamSource::DiffBookDepth { speed_ms: 100 });
         assert!(!update.is_snapshot);
         assert_eq!(update.bids.len(), 1);
         assert_eq!(update.bids[0].price, 96351.4);
@@ -689,7 +710,7 @@ mod tests {
         }"#;
 
         let update = parse_book_update(json, 0).unwrap();
-        assert_eq!(update.source, StreamSource::PartialBookDepth);
+        assert_eq!(update.source, StreamSource::PartialBookDepth { levels: 20, speed_ms: 100 });
         assert_eq!(update.bids.len(), 1);
         assert_eq!(update.asks.len(), 1);
     }
@@ -750,9 +771,15 @@ mod tests {
 
     #[test]
     fn display_stream_source() {
-        assert_eq!(format!("{}", StreamSource::PartialBookDepth), "partial_book_depth");
+        assert_eq!(
+            format!("{}", StreamSource::PartialBookDepth { levels: 20, speed_ms: 100 }),
+            "partial_book_depth<20>@100ms"
+        );
         assert_eq!(format!("{}", StreamSource::BookTicker), "book_ticker");
-        assert_eq!(format!("{}", StreamSource::DiffBookDepth), "diff_book_depth");
+        assert_eq!(
+            format!("{}", StreamSource::DiffBookDepth { speed_ms: 100 }),
+            "diff_book_depth@100ms"
+        );
         assert_eq!(format!("{}", StreamSource::Other("custom")), "other(custom)");
     }
 

@@ -13,14 +13,14 @@ async fn stream_to_book() {
     let configs = vec![
         StreamConfig::book_ticker("BTCUSDT"),
         StreamConfig::partial_depth("BTCUSDT", 20, 100),
-        StreamConfig::partial_depth("BTCUSDT", 20, 250),
+        // StreamConfig::partial_depth("BTCUSDT", 20, 250),
         StreamConfig::diff_depth("BTCUSDT", 100),
-        StreamConfig::diff_depth("BTCUSDT", 250),
+        // StreamConfig::diff_depth("BTCUSDT", 250),
     ];
 
     let mut receiver: StreamReceiver = StreamReceiver::new("BTCUSDT", 0.1, 0.001, configs);
 
-    // Print book state every 20 seconds, flush timing log every 5 seconds.
+    // Print book state every x seconds, flush timing log every x seconds.
     let mut last_print = Instant::now();
     let mut last_flush = Instant::now();
 
@@ -74,7 +74,7 @@ fn mock_book() {
     // ── 1. Initial snapshot from Partial Book Depth Stream ─────────────
     println!("[1] Snapshot  (source: partial_book_depth)");
     book.apply(&book::BookUpdate {
-        source: stream::StreamSource::PartialBookDepth,
+        source: stream::StreamSource::PartialBookDepth { levels: 20, speed_ms: 100 },
         exch_ts: 1746057600003000000,
         local_ts: util::now_nanos(),
         bids: vec![
@@ -111,7 +111,7 @@ fn mock_book() {
     // ── 3. Diff. Book Depth stream — new levels appear ────────────────
     println!("[3] Diff book depth (source: diff_book_depth) — add/remove levels");
     book.apply(&book::BookUpdate {
-        source: stream::StreamSource::DiffBookDepth,
+        source: stream::StreamSource::DiffBookDepth { speed_ms: 100 },
         exch_ts: 1746057600600000000,
         local_ts: util::now_nanos(),
         bids: vec![
