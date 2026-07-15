@@ -54,19 +54,7 @@ async fn stream_dry_run() {
 
     receiver.dry_run().await;
 }
-/*
-[apply]    500 ns  |  1 bids, 1 asks  |  source=book_ticker
-[apply]    333 ns  |  1 bids, 1 asks  |  source=book_ticker
-[apply]    375 ns  |  1 bids, 1 asks  |  source=book_ticker
-[apply]   2833 ns  |  1 bids, 1 asks  |  source=book_ticker
-[apply]  27875 ns  |  33 bids, 19 asks  |  source=diff_book_depth
-[apply]  11125 ns  |  20 bids, 20 asks  |  source=partial_book_depth
-[apply]   2875 ns  |  1 bids, 1 asks  |  source=book_ticker
-[apply]   1541 ns  |  1 bids, 1 asks  |  source=book_ticker
-[apply] 171292 ns  |  32 bids, 23 asks  |  source=diff_book_depth
-[apply]   6875 ns  |  20 bids, 20 asks  |  source=partial_book_depth
 
- */
 fn mock_book() {
     // ── Create a book for BTCUSDT ──────────────────────────────────────
     let mut book = book::LocalOrderBook::new("BTCUSDT", 0.01, 0.001);

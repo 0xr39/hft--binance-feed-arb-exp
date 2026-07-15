@@ -311,38 +311,36 @@ impl LocalOrderBook {
             }
             if !update.asks.is_empty() {
                 self.asks.clear();
+            }            
+        }
+        
+        if update.bids.len() > 50 || update.asks.len() > 50 {
+            let tick_size = self.tick_size;
+            let source = update.source;
+            let exch_ts = update.exch_ts;
+            let local_ts = update.local_ts;
+            let (bids, asks) = (&mut self.bids, &mut self.asks);
+            join(
+                || {
+                    for bid in &update.bids {
+                        store(bids, bid, source, exch_ts, local_ts, delay_ns, tick_size);
+                    }
+                },
+                || {
+                    for ask in &update.asks {
+                        store(asks, ask, source, exch_ts, local_ts, delay_ns, tick_size);
+                    }
+                },
+            );
+        } else {
+            for bid in &update.bids {
+                store(&mut self.bids, bid, update.source, update.exch_ts, update.local_ts, delay_ns, self.tick_size);
             }
-
-            {
-                let tick_size = self.tick_size;
-                let source = update.source;
-                let exch_ts = update.exch_ts;
-                let local_ts = update.local_ts;
-                let (bids, asks) = (&mut self.bids, &mut self.asks);
-                join(
-                    || {
-                        for bid in &update.bids {
-                            store(bids, bid, source, exch_ts, local_ts, delay_ns, tick_size);
-                        }
-                    },
-                    || {
-                        for ask in &update.asks {
-                            store(asks, ask, source, exch_ts, local_ts, delay_ns, tick_size);
-                        }
-                    },
-                );
-            }
-        }else {
-            {
-                for bid in &update.bids {
-                    store(&mut self.bids, bid, update.source, update.exch_ts, update.local_ts, delay_ns, self.tick_size);
-                }
-                for ask in &update.asks {
-                    store(&mut self.asks, ask, update.source, update.exch_ts, update.local_ts, delay_ns, self.tick_size);
-                }
+            for ask in &update.asks {
+                store(&mut self.asks, ask, update.source, update.exch_ts, update.local_ts, delay_ns, self.tick_size);
             }
         }
-
+        
         self.timing_log.borrow_mut().push(TimingRecord {
             elapsed_ns: start.elapsed().as_nanos(),
             bids: update.bids.len() as u32,

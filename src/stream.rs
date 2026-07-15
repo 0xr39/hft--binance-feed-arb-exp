@@ -35,7 +35,7 @@ impl std::fmt::Display for StreamSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::PartialBookDepth { levels, speed_ms } => {
-                write!(f, "partial_book_depth<{levels}>@{speed_ms}ms")
+                write!(f, "partial_book_depth{levels}@{speed_ms}ms")
             }
             Self::BookTicker => write!(f, "book_ticker"),
             Self::DiffBookDepth { speed_ms } => {
