@@ -599,7 +599,7 @@ mod tests {
     fn display_partial_book_depth() {
         assert_eq!(
             StreamSource::PartialBookDepth { levels: 20, speed_ms: 100 }.to_string(),
-            "partial_book_depth<20>@100ms",
+            "partial_book_depth20@100ms",
         );
     }
 
@@ -773,7 +773,7 @@ mod tests {
     fn display_stream_source() {
         assert_eq!(
             format!("{}", StreamSource::PartialBookDepth { levels: 20, speed_ms: 100 }),
-            "partial_book_depth<20>@100ms"
+            "partial_book_depth20@100ms"
         );
         assert_eq!(format!("{}", StreamSource::BookTicker), "book_ticker");
         assert_eq!(
