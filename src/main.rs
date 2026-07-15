@@ -28,11 +28,15 @@ async fn stream_to_book() {
     ));
     println!("{:.10}", book.lock().await);
 
-    // Configure streams.
+    // Configure streams. 100ms and 250ms just wont be accepted together, but different depth level can coexist
     let streams_configs = vec![
         StreamConfig::book_ticker("BTCUSDT"),
+        StreamConfig::partial_depth("BTCUSDT", 5, 100),
+        StreamConfig::partial_depth("BTCUSDT", 10, 100),
         StreamConfig::partial_depth("BTCUSDT", 20, 100),
+        // StreamConfig::partial_depth("BTCUSDT", 20, 250),
         StreamConfig::diff_depth("BTCUSDT", 100),
+        // StreamConfig::diff_depth("BTCUSDT", 250),
     ];
 
     let mut receiver: StreamReceiver = StreamReceiver::new(

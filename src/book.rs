@@ -337,33 +337,33 @@ impl LocalOrderBook {
             }            
         }
         
-        if update.bids.len() > 50 || update.asks.len() > 50 {
-            let tick_size = self.tick_size;
-            let source = update.source;
-            let exch_ts = update.exch_ts;
-            let local_ts = update.local_ts;
-            let (bids, asks) = (&mut self.bids, &mut self.asks);
-            join(
-                || {
-                    for bid in &update.bids {
-                        store(bids, bid, source, exch_ts, local_ts, delay_ns, tick_size);
-                    }
-                },
-                || {
-                    for ask in &update.asks {
-                        store(asks, ask, source, exch_ts, local_ts, delay_ns, tick_size);
-                    }
-                },
-            );
-        } else {
-            for bid in &update.bids {
-                store(&mut self.bids, bid, update.source, update.exch_ts, update.local_ts, delay_ns, self.tick_size);
-            }
-            for ask in &update.asks {
-                store(&mut self.asks, ask, update.source, update.exch_ts, update.local_ts, delay_ns, self.tick_size);
-            }
+        // parallel, not worth it for the overhead, even 1000 bid asks are just ~300 microseconds
+        // let tick_size = self.tick_size;
+        // let source = update.source;
+        // let exch_ts = update.exch_ts;
+        // let local_ts = update.local_ts;
+        // let (bids, asks) = (&mut self.bids, &mut self.asks);
+        // join(
+        //     || {
+        //         for bid in &update.bids {
+        //             store(bids, bid, source, exch_ts, local_ts, delay_ns, tick_size);
+        //         }
+        //     },
+        //     || {
+        //         for ask in &update.asks {
+        //             store(asks, ask, source, exch_ts, local_ts, delay_ns, tick_size);
+        //         }
+        //     },
+        // );
+
+        // serial, simpler and faster for small updates
+        for bid in &update.bids {
+            store(&mut self.bids, bid, update.source, update.exch_ts, update.local_ts, delay_ns, self.tick_size);
         }
-        
+        for ask in &update.asks {
+            store(&mut self.asks, ask, update.source, update.exch_ts, update.local_ts, delay_ns, self.tick_size);
+        }
+    
         self.timing_log.borrow_mut().push(TimingRecord {
             elapsed_ns: start.elapsed().as_nanos(),
             exch_ts: update.exch_ts,
@@ -451,35 +451,35 @@ impl LocalOrderBook {
     /// Write ask levels with delay info to a formatter, up to `depth` levels.
     fn log_write_asks(&self, f: &mut std::fmt::Formatter<'_>, depth: Option<usize>) -> std::fmt::Result {
         let delay_ms = (self.last_local_ts - self.last_exch_ts) / 1_000_000;
-        let mut print_counter: usize = 0;
 
-        let asks = self.asks.iter().take(usize::MAX).rev();
+        let asks = self.asks.iter();
+        let mut print_lines: Vec<String> = Vec::new();
         if self.last_update_source == Some(StreamSource::BookTicker) {
-            // BBO ask as a regular depth line at the top.
-            let best_price = self.bbo_ask.map(|a| a.price);
-
-            for (_tick, meta) in asks {
-                if print_counter > depth.unwrap_or(usize::MAX)-1 { break; }
-                let price = *_tick as f64 * self.tick_size;
-                if Some(price) > best_price {
-                    writeln!(f, "  {:.10} @ {:.1}  data_age={}ms, last_source={}", meta.qty, price, (self.last_local_ts - meta.last_exch_ts) / 1_000_000, meta.source)?;
-                    print_counter += 1;
-                }
-            }
+            // Push BBO first so it lands last after .rev() (bottom of asks display).
             if let Some(bbo) = self.bbo_ask {
-                writeln!(
-                    f,
+                print_lines.push(format!(
                     "  {:.10} @ {:.1}  data_age={}ms, last_source=book_ticker",
                     bbo.qty, bbo.price, delay_ms,
-                )?;
+                ));
+            }
+
+            let best_price = self.bbo_ask.map(|a| a.price);
+            for (_tick, meta) in asks {
+                if print_lines.len() > depth.unwrap_or(usize::MAX)-1 { break; }
+                let price = *_tick as f64 * self.tick_size;
+                if Some(price) > best_price {
+                    print_lines.push(format!("  {:.10} @ {:.1}  data_age={}ms, last_source={}", meta.qty, price, (self.last_local_ts - meta.last_exch_ts) / 1_000_000, meta.source));
+                }
             }
         } else {
             for (_tick, meta) in asks {
-                if print_counter > depth.unwrap_or(usize::MAX)-1 { break; }
+                if print_lines.len() > depth.unwrap_or(usize::MAX)-1 { break; }
                 let price = *_tick as f64 * self.tick_size;
-                writeln!(f, "  {:.10} @ {:.1}  data_age={}ms, last_source={}", meta.qty, price, (self.last_local_ts - meta.last_exch_ts) / 1_000_000, meta.source)?;
-                print_counter += 1;
+                print_lines.push(format!("  {:.10} @ {:.1}  data_age={}ms, last_source={}", meta.qty, price, (self.last_local_ts - meta.last_exch_ts) / 1_000_000, meta.source));
             }
+        }
+        for line in print_lines.iter().rev() {
+            writeln!(f, "{line}")?;
         }
         Ok(())
     }
@@ -489,7 +489,7 @@ impl LocalOrderBook {
         let delay_ms = (self.last_local_ts - self.last_exch_ts) / 1_000_000;
         let mut print_counter: usize = 0;
 
-        let bids = self.bids.iter().rev().take(usize::MAX);
+        let bids = self.bids.iter().rev();
         if self.last_update_source == Some(StreamSource::BookTicker) {
             if let Some(bbo) = self.bbo_bid {
                 writeln!(
