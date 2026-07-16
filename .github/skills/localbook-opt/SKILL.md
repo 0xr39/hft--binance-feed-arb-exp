@@ -48,9 +48,9 @@ TimingRecord { elapsed_ns: u128, exch_ts: i64, local_ts: i64, bids: u32, asks: u
 3. **Branch on update type:**
    - **Snapshot** (`is_snapshot == true`) — clear BBO cache + clear relevant side(s), fall through to `store()`.
    - **BookTicker** — update BBO cache only (`bbo_bid`/`bbo_ask`), push timing log, **return early** — no BTreeMap interaction.
-   - **PartialBookDepth** — update BBO cache from the first bid/ask (top of book), then fall through to `store()` for full depth insertion.
+   - **PartialBookDepth** — update BBO cache from the first bid/ask (top of book), then **bulk-replace** the visible BTreeMap range via `split_off` + reassign + `extend`, push timing log, **return early** — skips `store()`.
    - **DiffBookDepth** (else) — fall through directly to `store()`.
-4. **Depth insertion** — call standalone `store()` fn for each bid and ask level (serial, not parallel — parallel overhead exceeds benefit for typical update sizes).
+4. **Depth insertion** — for `DiffBookDepth` and `Snapshot`: call standalone `store()` fn for each bid and ask level (serial, not parallel — parallel overhead exceeds benefit for typical update sizes).
 5. `self.timing_log.borrow_mut().push(TimingRecord { ... })` — pushes a cheap struct (no heap alloc, no syscall).
 
 ### Timestamp-guarded writes
@@ -218,22 +218,20 @@ BBO cache lines are always printed first (with data_age and delay), then depth-t
 
 ## Future Optimization Ideas
 
-### Bulk-replace book levels on `PartialBookDepth` (Proposed)
-
-**Status: not yet implemented.**
+### Bulk-replace book levels on `PartialBookDepth` (Applied 2026-07-17)
 
 #### Motivation
 
-`PartialBookDepth` provides a **complete, already-sorted snapshot** of the top N levels (e.g. depth20@100ms sends all 20 best bids and 20 best asks). Currently, these levels are inserted one-by-one via `store()`, which for each level:
+`PartialBookDepth` provides a **complete, already-sorted snapshot** of the top N levels (e.g. depth20@100ms sends all 20 best bids and 20 best asks). Previously, these levels were inserted one-by-one via `store()`, which for each level:
 
 1. Computes the tick: `((price + 1e-9) / tick_size).floor() as u64`
 2. Does a BTreeMap entry lookup (`O(log n)`)
 3. Checks the timestamp guard (`exch_ts > last_exch_ts`)
 4. Inserts or removes
 
-This is wasteful because `PartialBookDepth` data is **authoritative for its visible range** — we know all 20 levels are correct and in order. We don't need per-level timestamp guards.
+This was wasteful because `PartialBookDepth` data is **authoritative for its visible range** — we know all 20 levels are correct and in order. We don't need per-level timestamp guards.
 
-#### Recommended algorithm: `split_off` + `extend`
+#### Algorithm: `split_off` + reassign + `extend`
 
 ```rust
 } else if matches!(update.source, StreamSource::PartialBookDepth { .. }) {
@@ -261,9 +259,13 @@ This is wasteful because `PartialBookDepth` data is **authoritative for its visi
     }
 
     // ── Asks ──
+    // `split_off(&k)` puts entries >= k into `deeper` (truly deeper asks).
+    // What remains in `self.asks` (the visible overlap) is discarded by
+    // overwriting with `deeper`. Then extend fresh levels.
     if !update.asks.is_empty() {
         let worst_ask_tick = ((update.asks.last().unwrap().price + 1e-9) / self.tick_size).floor() as u64;
-        let mut deeper = self.asks.split_off(&(worst_ask_tick + 1));  // keep deeper half
+        let deeper = self.asks.split_off(&(worst_ask_tick + 1));  // keep deeper half
+        self.asks = deeper;  // drop stale visible range
 
         self.asks.extend(
             update.asks.iter().map(|ask| {
@@ -277,42 +279,24 @@ This is wasteful because `PartialBookDepth` data is **authoritative for its visi
                 })
             }),
         );
-
-        // Re-graft deeper half (single tree -> append is fine here).
-        self.asks.append(&mut deeper);
     }
 
     let elapsed = start.elapsed().as_nanos();
     self.timing_log.borrow_mut().push(TimingRecord { ... });
     return;  // skip store() loop at the bottom
 }
-```
+``````
 
 #### Complexity comparison
 
 | Strategy | Cost | Deeper levels preserved? | Heap allocs |
 |---|---|---|---|
-| `store()` per level (current) | **O(m · log n)** | ✅ Yes (timestamp-guarded) | 0 (reuses existing nodes) |
+| `store()` per level | **O(m · log n)** | ✅ Yes (timestamp-guarded) | 0 (reuses existing nodes) |
 | `clear()` + individual `insert()` | O(n + m · log m) | ❌ All lost | m new nodes |
 | `retain()` + individual `insert()` | O(n + m · log n) | ✅ Only overlap dropped | m new nodes |
-| `split_off` + `extend` | O(log n + k + m · log(n − k)) | ✅ Only overlap (k) dropped | 0 (inserts into existing tree) |
-| **`split_off` + `append`** | **O(log n + k + m · log m + log(n − k))** | ✅ Only overlap (k) dropped | m new nodes (temp tree) |
-| **`split_off` + `extend`** | **O(log n + k + m · log(n − k))** | ✅ Only overlap (k) dropped | 0 |
+| `split_off` + reassign + `extend` **(used)** | **O(log n + k + m · log(n − k))** | ✅ Only overlap (k) dropped | 0 |
 
-Where: `n` = total levels in book, `m` = update size (e.g. 20), `k` = overlap removed by `split_off` (≈ m).
-
-#### Why not `append` with a temp tree?
-
-`BTreeMap::append` can graft entire subtrees (O(log remaining)), but it requires building a **separate `BTreeMap`** first — allocating B-tree nodes for all `m` entries. For `m = 20`:
-
-| Approach | Comparisons | Heap allocs |
-|---|---|---|
-| Build temp tree + `append` | ~90 | ~2 internal nodes + 20 leaf slots |
-| `split_off` + `extend` | ~210 | **0** (reuses existing node capacity) |
-
-The temp tree's **allocation overhead** outweighs the theoretical savings from ~120 fewer comparisons. And the 20 `insert` calls hit **adjacent B-tree leaves** (ascending ticks), so they're practically much faster than O(log n) worst-case.
-
-The one `append` worth keeping: re-grafting the deeper half for asks — that's a single existing tree, no temp tree needed.
+Where: `n` = total levels in book, `m` = update size (e.g. 20), `k` = overlap removed by `split_off` (≈ m). For asks, `self.asks = deeper` drops the stale visible range at zero cost (move assignment drops the old map).
 
 #### Expected improvement
 

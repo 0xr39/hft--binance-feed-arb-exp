@@ -17,14 +17,14 @@ async fn stream_to_book() {
     let rest_base = stream::urls::REST_FAPI;
     let snapshot_url = format!("{rest_base}?symbol={SYMBOL}&limit=1000");
     let book = Arc::new(Mutex::new(
-        match book::LocalOrderBook::from_snapshot(SYMBOL, 0.1, 0.001, &snapshot_url).await {
+        match book::LocalOrderBook::from_snapshot(SYMBOL, 0.1, 0.001, None, &snapshot_url).await {
             Ok(b) => {
                 println!("[snapshot] Initial snapshot applied");
                 b
             }
             Err(e) => {
                 eprintln!("[snapshot] Initial fetch failed: {e} — starting empty");
-                book::LocalOrderBook::new(SYMBOL, 0.1, 0.001)
+                book::LocalOrderBook::new(SYMBOL, 0.1, 0.001, None)
             }
         },
     ));
@@ -59,7 +59,7 @@ async fn stream_to_book() {
                 last_flush = Instant::now();
             }
             if last_print.elapsed().as_secs() >= 5 {
-                println!("{:.10}", book);
+                println!("{:.30}", book);
                 last_print = Instant::now();
             }
         }))
@@ -69,7 +69,7 @@ async fn stream_to_book() {
 async fn stream_dry_run() {
     println!("=== hft--binance-feed-arb-exp  |  Async Stream Receiver (dry-run) ===\n");
 
-    let book = Arc::new(Mutex::new(book::LocalOrderBook::new(SYMBOL, 0.1, 0.001)));
+    let book = Arc::new(Mutex::new(book::LocalOrderBook::new(SYMBOL, 0.1, 0.001, None)));
 
     let configs = vec![
         StreamConfig::book_ticker(SYMBOL),
@@ -91,7 +91,7 @@ async fn stream_dry_run() {
 
 fn mock_book() {
     // ── Create a book for BTCUSDT ──────────────────────────────────────
-    let mut book = book::LocalOrderBook::new(SYMBOL, 0.01, 0.001);
+    let mut book = book::LocalOrderBook::new(SYMBOL, 0.01, 0.001, None);
 
     // ── 1. Initial snapshot from Partial Book Depth Stream ─────────────
     println!("[1] Snapshot  (source: partial_book_depth)");

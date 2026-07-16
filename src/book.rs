@@ -73,6 +73,8 @@ pub struct LocalOrderBook {
     pub tick_size: f64,
     /// Lot size (minimum quantity increment).
     pub lot_size: f64,
+    /// max book size
+    pub max_depth: Option<usize>,
 
     // --- Book state -------------------------------------------------------
     /// Cached best bid (tick, metadata) from BookTicker stream.
@@ -129,7 +131,7 @@ struct LevelMeta {
 ///
 /// Standalone function (not a closure) so the compiler can inline it freely,
 /// and so it can be called from `rayon::join` closures without capturing `self`.
-fn store(
+fn diff_update(
     map: &mut BTreeMap<u64, LevelMeta>,
     level: &PriceLevel,
     source: StreamSource,
@@ -171,11 +173,12 @@ fn store(
 
 impl LocalOrderBook {
     /// Create a new empty order book for `symbol`.
-    pub fn new(symbol: impl Into<String>, tick_size: f64, lot_size: f64) -> Self {
+    pub fn new(symbol: impl Into<String>, tick_size: f64, lot_size: f64, max_depth: Option<usize>) -> Self {
         Self {
             symbol: symbol.into(),
             tick_size,
             lot_size,
+            max_depth,
             bbo_bid: None,
             bbo_ask: None,
             bids: BTreeMap::new(),
@@ -375,15 +378,65 @@ impl LocalOrderBook {
                     delay_ns: update.local_ts - update.exch_ts,
                 }));
             }
+
+            // ── Bulk-replace: split_off overlap + extend fresh levels ──
+            // PartialBookDepth = complete sorted top-N snapshot, authoritative
+            // for its visible range.  No per-level store() needed.
+
+            // Bids: drop the overlapped range, then extend with fresh levels
+            // (worst->best = ascending ticks = adjacent B-tree leaves).
+            // time cost: O(log n) for split_off + O(k) for extend, where k = update.bids.len(), cache line stays hot with sorted levels.
+            if !update.bids.is_empty() {
+                let worst_bid_tick = ((update.bids.last().unwrap().price + 1e-9) / self.tick_size).floor() as u64;
+                let _ = self.bids.split_off(&worst_bid_tick);
+
+                self.bids.extend(
+                    update.bids.iter().rev().map(|bid| {
+                        let tick = ((bid.price + 1e-9) / self.tick_size).floor() as u64;
+                        (tick, LevelMeta {
+                            qty: bid.qty,
+                            source: update.source,
+                            last_exch_ts: update.exch_ts,
+                            last_local_ts: update.local_ts,
+                            delay_ns: update.local_ts - update.exch_ts,
+                        })
+                    }),
+                );
+            }
+
+            // Asks: discard visible range, keep deeper entries, extend fresh levels.
+            if !update.asks.is_empty() {
+                let worst_ask_tick = ((update.asks.last().unwrap().price + 1e-9) / self.tick_size).floor() as u64;
+                let deeper = self.asks.split_off(&(worst_ask_tick + 1));
+                // Drop the stale visible range; `deeper` becomes the new map.
+                self.asks = deeper;
+                self.asks.extend(
+                    update.asks.iter().map(|ask| {
+                        let tick = ((ask.price + 1e-9) / self.tick_size).floor() as u64;
+                        (tick, LevelMeta {
+                            qty: ask.qty,
+                            source: update.source,
+                            last_exch_ts: update.exch_ts,
+                            last_local_ts: update.local_ts,
+                            delay_ns: update.local_ts - update.exch_ts,
+                        })
+                    }),
+                );
+            }
+
+            let elapsed = start.elapsed().as_nanos();
+            self.timing_log.borrow_mut().push(TimingRecord {
+                elapsed_ns: elapsed,
+                exch_ts: update.exch_ts,
+                local_ts: update.local_ts,
+                bids: update.bids.len() as u32,
+                asks: update.asks.len() as u32,
+                source: update.source,
+            });
+            return;  // skip store() loop below
         }
 
-        // ── Depth updates (DiffBookDepth | PartialBookDepth) ───────────
-        // println!(
-        //     "[apply] depth update: {} bids, {} asks  |  source={}",
-        //     update.bids.len(),
-        //     update.asks.len(),
-        //     update.source
-        // );
+        // ── Depth updates (DiffBookDepth only — PartialBookDepth returned) ──
 
         // parallel, not worth it for the overhead, even 1000 bid asks are just ~300 microseconds
         // let tick_size = self.tick_size;
@@ -406,10 +459,10 @@ impl LocalOrderBook {
 
         // serial, simpler and faster for small updates
         for bid in &update.bids {
-            store(&mut self.bids, bid, update.source, update.exch_ts, update.local_ts, update.local_ts - update.exch_ts, self.tick_size);
+            diff_update(&mut self.bids, bid, update.source, update.exch_ts, update.local_ts, update.local_ts - update.exch_ts, self.tick_size);
         }
         for ask in &update.asks {
-            store(&mut self.asks, ask, update.source, update.exch_ts, update.local_ts, update.local_ts - update.exch_ts, self.tick_size);
+            diff_update(&mut self.asks, ask, update.source, update.exch_ts, update.local_ts, update.local_ts - update.exch_ts, self.tick_size);
         }
         
         let elapsed = start.elapsed().as_nanos();
@@ -439,10 +492,11 @@ impl LocalOrderBook {
         symbol: impl Into<String>,
         tick_size: f64,
         lot_size: f64,
+        max_depth: Option<usize>,
         full_url: &str,
     ) -> Result<Self, SnapshotError> {
         let update = fetch_depth_snapshot(full_url).await?;
-        let mut book = Self::new(symbol, tick_size, lot_size);
+        let mut book = Self::new(symbol, tick_size, lot_size, max_depth);
         book.apply_snapshot(&update);
         Ok(book)
     }
@@ -491,6 +545,30 @@ impl LocalOrderBook {
         }
         eprintln!("{buf}");
         log.clear();
+    }
+
+    /// Trim bids and asks to at most `max_depth` levels, keeping the best
+    /// (closest to the spread) levels on each side. No-op when `max_depth` is `None`.
+    fn trim_to_max_depth(&mut self) {
+        let Some(max_depth) = self.max_depth else { return };
+        if max_depth == 0 {
+            self.bids.clear();
+            self.asks.clear();
+            return;
+        }
+
+        // Bids are sorted ascending. Best bids = highest ticks (end of iteration).
+        if self.bids.len() > max_depth {
+            let keep_tick = self.bids.iter().rev().nth(max_depth - 1).map(|(t, _)| *t).unwrap();
+            let keep = self.bids.split_off(&keep_tick);
+            self.bids = keep;
+        }
+
+        // Asks are sorted ascending. Best asks = lowest ticks (start of iteration).
+        if self.asks.len() > max_depth {
+            let worst_keep_tick = self.asks.iter().nth(max_depth - 1).map(|(t, _)| *t).unwrap();
+            let _ = self.asks.split_off(&(worst_keep_tick + 1));
+        }
     }
 }
 
@@ -664,7 +742,7 @@ mod tests {
 
     #[test]
     fn snapshot_replaces_book() {
-        let mut book = LocalOrderBook::new("BTCUSDT", 0.1, 0.001);
+        let mut book = LocalOrderBook::new("BTCUSDT", 0.1, 0.001, None);
 
         // Apply a snapshot
         let snap = BookUpdate {
@@ -698,7 +776,7 @@ mod tests {
 
     #[test]
     fn diff_upserts_and_removes() {
-        let mut book = LocalOrderBook::new("ETHUSDT", 0.01, 0.001);
+        let mut book = LocalOrderBook::new("ETHUSDT", 0.01, 0.001, None);
 
         // Seed with a snapshot
         book.apply(&BookUpdate {
@@ -729,7 +807,7 @@ mod tests {
 
     #[test]
     fn tracks_stream_source_per_level() {
-        let mut book = LocalOrderBook::new("BTCUSDT", 0.1, 0.001);
+        let mut book = LocalOrderBook::new("BTCUSDT", 0.1, 0.001, None);
 
         book.apply(&BookUpdate {
             source: StreamSource::BookTicker,
