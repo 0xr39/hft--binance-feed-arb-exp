@@ -231,89 +231,97 @@ BBO cache lines are always printed first (with data_age and delay), then depth-t
 3. Checks the timestamp guard (`exch_ts > last_exch_ts`)
 4. Inserts or removes
 
-This is wasteful because `PartialBookDepth` data is **authoritative for its visible range** — we know all 20 levels are correct and in order. We don't need per-level timestamp guards (nothing is older/overlapping since we own the entire visible range).
+This is wasteful because `PartialBookDepth` data is **authoritative for its visible range** — we know all 20 levels are correct and in order. We don't need per-level timestamp guards.
 
-#### Proposal
-
-Replace the per-level `store()` loop with a clear + bulk-insert for the affected side(s):
+#### Recommended algorithm: `split_off` + `extend`
 
 ```rust
 } else if matches!(update.source, StreamSource::PartialBookDepth { .. }) {
-    // PartialBookDepth = complete sorted top-N snapshot
-    // No need for per-level store() — clear and bulk-insert instead.
-
-    // 1. Update BBO cache from first level (already done)
+    // Update BBO cache from first level (already done)
     // ...
 
-    // 2. Clear the relevant side(s) — we own the entire visible range
+    // ── Bids ──
     if !update.bids.is_empty() {
-        self.bids.clear();       // or retain only levels beyond top-N
+        let worst_bid_tick = ((update.bids.last().unwrap().price + 1e-9) / self.tick_size).floor() as u64;
+        let _ = self.bids.split_off(&worst_bid_tick);  // drop overlap
+
+        // Extend with fresh levels (worst->best = ascending ticks = adjacent leaves).
+        self.bids.extend(
+            update.bids.iter().rev().map(|bid| {
+                let tick = ((bid.price + 1e-9) / self.tick_size).floor() as u64;
+                (tick, LevelMeta {
+                    qty: bid.qty,
+                    source: update.source,
+                    last_exch_ts: update.exch_ts,
+                    last_local_ts: update.local_ts,
+                    delay_ns: update.local_ts - update.exch_ts,
+                })
+            }),
+        );
     }
+
+    // ── Asks ──
     if !update.asks.is_empty() {
-        self.asks.clear();
+        let worst_ask_tick = ((update.asks.last().unwrap().price + 1e-9) / self.tick_size).floor() as u64;
+        let mut deeper = self.asks.split_off(&(worst_ask_tick + 1));  // keep deeper half
+
+        self.asks.extend(
+            update.asks.iter().map(|ask| {
+                let tick = ((ask.price + 1e-9) / self.tick_size).floor() as u64;
+                (tick, LevelMeta {
+                    qty: ask.qty,
+                    source: update.source,
+                    last_exch_ts: update.exch_ts,
+                    last_local_ts: update.local_ts,
+                    delay_ns: update.local_ts - update.exch_ts,
+                })
+            }),
+        );
+
+        // Re-graft deeper half (single tree -> append is fine here).
+        self.asks.append(&mut deeper);
     }
 
-    // 3. Bulk-insert all levels — they're already sorted correctly.
-    //    No timestamp guard needed because we cleared first.
-    for bid in &update.bids {
-        let tick = ((bid.price + 1e-9) / self.tick_size).floor() as u64;
-        self.bids.insert(tick, LevelMeta {
-            qty: bid.qty,
-            source: update.source,
-            last_exch_ts: update.exch_ts,
-            last_local_ts: update.local_ts,
-            delay_ns: update.local_ts - update.exch_ts,
-        });
-    }
-    for ask in &update.asks {
-        let tick = ((ask.price + 1e-9) / self.tick_size).floor() as u64;
-        self.asks.insert(tick, LevelMeta {
-            qty: ask.qty,
-            source: update.source,
-            last_exch_ts: update.exch_ts,
-            last_local_ts: update.local_ts,
-            delay_ns: update.local_ts - update.exch_ts,
-        });
-    }
-
-    // No fall-through to the store() loop below.
-    // Push timing log and return early.
     let elapsed = start.elapsed().as_nanos();
     self.timing_log.borrow_mut().push(TimingRecord { ... });
-    return;
+    return;  // skip store() loop at the bottom
 }
 ```
 
-#### Key insight
+#### Complexity comparison
 
-`PartialBookDepth` gives us **sorted, authoritative data** for the visible range. We don't need:
-- **`store()`'s timestamp guard** — we cleared the side, so there's no existing entry to compare against
-- **`store()`'s vacate/occupy branching** — we know every level is an insert (or we skip `qty == 0.0` early)
-- **Individual entry lookups** — `BTreeMap::insert` on a cleared map is just allocation, not an O(log n) search that collides with existing keys
+| Strategy | Cost | Deeper levels preserved? | Heap allocs |
+|---|---|---|---|
+| `store()` per level (current) | **O(m · log n)** | ✅ Yes (timestamp-guarded) | 0 (reuses existing nodes) |
+| `clear()` + individual `insert()` | O(n + m · log m) | ❌ All lost | m new nodes |
+| `retain()` + individual `insert()` | O(n + m · log n) | ✅ Only overlap dropped | m new nodes |
+| `split_off` + `extend` | O(log n + k + m · log(n − k)) | ✅ Only overlap (k) dropped | 0 (inserts into existing tree) |
+| **`split_off` + `append`** | **O(log n + k + m · log m + log(n − k))** | ✅ Only overlap (k) dropped | m new nodes (temp tree) |
+| **`split_off` + `extend`** | **O(log n + k + m · log(n − k))** | ✅ Only overlap (k) dropped | 0 |
 
-If we want to preserve levels **beyond** the top-N (e.g., a diff stream tracks depth 21+), instead of `self.bids.clear()`, we can `retain` only levels outside the visible price range:
+Where: `n` = total levels in book, `m` = update size (e.g. 20), `k` = overlap removed by `split_off` (≈ m).
 
-```rust
-// Only evict levels within the partial depth's visible range.
-// For bids: remove levels cheaper than the worst bid in the update.
-if let Some(worst_bid) = update.bids.last() {
-    let worst_tick = ((worst_bid.price + 1e-9) / self.tick_size).floor() as u64;
-    self.bids.retain(|tick, _| *tick > worst_tick);  // bids: higher tick = higher price
-}
-if let Some(worst_ask) = update.asks.last() {
-    let worst_tick = ((worst_ask.price + 1e-9) / self.tick_size).floor() as u64;
-    self.asks.retain(|tick, _| *tick < worst_tick);  // asks: lower tick = lower price
-}
-```
+#### Why not `append` with a temp tree?
+
+`BTreeMap::append` can graft entire subtrees (O(log remaining)), but it requires building a **separate `BTreeMap`** first — allocating B-tree nodes for all `m` entries. For `m = 20`:
+
+| Approach | Comparisons | Heap allocs |
+|---|---|---|
+| Build temp tree + `append` | ~90 | ~2 internal nodes + 20 leaf slots |
+| `split_off` + `extend` | ~210 | **0** (reuses existing node capacity) |
+
+The temp tree's **allocation overhead** outweighs the theoretical savings from ~120 fewer comparisons. And the 20 `insert` calls hit **adjacent B-tree leaves** (ascending ticks), so they're practically much faster than O(log n) worst-case.
+
+The one `append` worth keeping: re-grafting the deeper half for asks — that's a single existing tree, no temp tree needed.
 
 #### Expected improvement
 
 From profiling baseline (debug mode):
-| Current (per-level `store()`) | Proposed (bulk) | Speedup |
+| Current (per-level `store()`) | Proposed (`split_off` + `extend`) | Speedup |
 |---|---|---|
-| ~3-8 µs for 20+20 levels | ~1-3 µs | ~2-3x |
+| ~3-8 µs for 20+20 levels | ~1-2 µs | ~3-4x |
 
-The gain comes from eliminating `O(log n)` entry lookups for existing keys that don't exist (since we cleared), and removing the timestamp guard branch.
+The gain comes from eliminating `store()`'s timestamp guard branch and vacate/occupy logic for every level — not from the tree operations themselves, which are already fast for small `m`.
 
 ### Parallelize bids and asks with `rayon::join`
 
