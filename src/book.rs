@@ -309,6 +309,7 @@ impl LocalOrderBook {
         // ── BookTicker fast-path: update BBO cache only, skip BTreeMap ──
         // This is the hottest stream (~tens of ms between ticks), so we
         // avoid O(log n) BTreeMap operations entirely.
+        // eprintln!("{:?}", update);
         if update.is_snapshot {
             self.last_snapshot_ts = update.exch_ts;
             self.bbo_bid = None;
@@ -510,8 +511,8 @@ impl LocalOrderBook {
         if let Some((tick, meta)) = self.bbo_ask {
             let price = tick as f64 * self.tick_size;
             print_lines.push(format!(
-                "  {:.10} @ {:.10} delay={}ms, last_source={}",
-                meta.qty, price, delay_ms, meta.source
+                "  {:.10} @ {:.10}  data_age={}ms, delay={}ms, last_source={}",
+                meta.qty, price, (self.last_local_ts - meta.last_local_ts) / 1_000_000, delay_ms, meta.source
             ));
         }
 
@@ -541,8 +542,8 @@ impl LocalOrderBook {
             let price = tick as f64 * self.tick_size;
             writeln!(
                 f,
-                "  {:.10} @ {:.10}  delay={}ms, last_source={}",
-                meta.qty, price, delay_ms, meta.source
+                "  {:.10} @ {:.10}  data_age={}ms, delay={}ms, last_source={}",
+                meta.qty, price, (self.last_local_ts - meta.last_local_ts) / 1_000_000, delay_ms, meta.source
             )?;
         }
 

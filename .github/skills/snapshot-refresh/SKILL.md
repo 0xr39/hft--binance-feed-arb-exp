@@ -273,24 +273,27 @@ through `on_update`.
 |---|---|---|
 | `book` | `Arc<Mutex<LocalOrderBook>>` | Shared between WS loop and snapshot background task |
 | `configs` | `Vec<StreamConfig>` | Unchanged |
-| `rest_url` | `String` | Built once, e.g. `https://fapi.binance.com/fapi/v1/depth?symbol=BTCUSDT&limit=100` |
+| `rest_url` | `String` | Built once, e.g. `https://fapi.binance.com/fapi/v1/depth` (without query params) |
+| `symbol` | `String` | Trading pair, e.g. `"BTCUSDT"` |
+| `snapshot_limit` | `u32` | How many levels to request from REST (default 1000) |
 | `snapshot_interval` | `Duration` | How often to refresh (default 30s) |
 
-Constructor changes from:
+Constructor signature:
 ```rust
-pub fn new(symbol: impl Into<String>, tick_size: f64, lot_size: f64, configs: Vec<StreamConfig>) -> Self
-```
-to:
-```rust
-pub fn new(book: Arc<Mutex<LocalOrderBook>>, configs: Vec<StreamConfig>, rest_url: String) -> Self
+pub fn new(
+    book: Arc<Mutex<LocalOrderBook>>,
+    configs: Vec<StreamConfig>,
+    rest_url: String,
+    symbol: impl Into<String>,
+) -> Self
 ```
 
 ### Changes to callback
 
-The callback now receives a `MutexGuard<LocalOrderBook>` instead of `&LocalOrderBook`:
+The callback receives `&LocalOrderBook` (the `MutexGuard` is deref'd by the caller):
 
 ```rust
-mut on_update: Box<dyn FnMut(MutexGuard<LocalOrderBook>) + Send>
+mut on_update: Box<dyn FnMut(&LocalOrderBook) + Send>
 ```
 
 The guard is held for the duration of the callback — the caller should keep
