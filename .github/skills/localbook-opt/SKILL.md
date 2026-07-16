@@ -49,13 +49,14 @@ TimingRecord { elapsed_ns: u128, exch_ts: i64, local_ts: i64, bids: u32, asks: u
    - **Snapshot** (`is_snapshot == true`) — clear BBO cache + clear relevant side(s), fall through to `store()`.
    - **BookTicker** — update BBO cache only (`bbo_bid`/`bbo_ask`), push timing log, **return early** — no BTreeMap interaction.
    - **PartialBookDepth** — update BBO cache from the first bid/ask (top of book), then **bulk-replace** the visible BTreeMap range via `split_off` + reassign + `extend`, push timing log, **return early** — skips `store()`.
-   - **DiffBookDepth** (else) — fall through directly to `store()`.
-4. **Depth insertion** — for `DiffBookDepth` and `Snapshot`: call standalone `store()` fn for each bid and ask level (serial, not parallel — parallel overhead exceeds benefit for typical update sizes).
+   - **DiffBookDepth** (else) — fall through directly to `diff_update()`.
+4. **Depth insertion** — for `DiffBookDepth` and `Snapshot`: call standalone `diff_update()` fn for each bid and ask level (serial, not parallel — parallel overhead exceeds benefit for typical update sizes).
+5. **Trim to max_depth** — `trim_to_max_depth()` is called after depth insertion to drop levels beyond `max_depth`. This is a cheap post-insert trim (O(N) worst-case but almost always a no-op since `PartialBookDepth` keeps the book within bounds).
 5. `self.timing_log.borrow_mut().push(TimingRecord { ... })` — pushes a cheap struct (no heap alloc, no syscall).
 
 ### Timestamp-guarded writes
 
-When multiple conflated streams feed the same book, updates for the same price level can arrive out of order (e.g., a stale `DiffBookDepth` update arriving after a fresher `BookTicker` update). The `store()` closure guards against this:
+When multiple conflated streams feed the same book, updates for the same price level can arrive out of order (e.g., a stale `DiffBookDepth` update arriving after a fresher `BookTicker` update). The `diff_update()` function guards against this:
 
 - Before any insert or remove, it checks `exch_ts > existing.last_exch_ts`.
 - If the incoming update is **older** (or equal) to what's already stored, it is **silently dropped** — the per-level `last_exch_ts` in `LevelMeta` serves as a Lamport-clock-style watermark.
@@ -89,7 +90,7 @@ When multiple conflated streams feed the same book, updates for the same price l
 [apply]   5375 ns  |  18 bids, 12 asks  |  source=diff_book_depth
 ```
 
-Note: The per-call `eprintln!` has been replaced with the batched timing log — these timings reflect pure book logic + `Vec::push` for the timing buffer. The 171 µs outlier from the old per-call `eprintln!` approach is gone. The current bottleneck is BTreeMap operations on depth updates (up to ~33 µs for 70 levels). A debug `eprintln!("{:?}", update)` is currently present at the top of `apply()` and should be removed before production profiling.
+Note: The per-call `eprintln!` has been replaced with the batched timing log — these timings reflect pure book logic + `Vec::push` for the timing buffer. The 171 µs outlier from the old per-call `eprintln!` approach is gone. The current bottleneck is BTreeMap operations on depth updates (up to ~33 µs for 70 levels). A debug `eprintln!("{:?}", update)` was present at the top of `apply()` during development but has been commented out.
 
 ---
 
@@ -291,7 +292,7 @@ This was wasteful because `PartialBookDepth` data is **authoritative for its vis
 
 | Strategy | Cost | Deeper levels preserved? | Heap allocs |
 |---|---|---|---|
-| `store()` per level | **O(m · log n)** | ✅ Yes (timestamp-guarded) | 0 (reuses existing nodes) |
+| `diff_update()` per level | **O(m · log n)** | ✅ Yes (timestamp-guarded) | 0 (reuses existing nodes) |
 | `clear()` + individual `insert()` | O(n + m · log m) | ❌ All lost | m new nodes |
 | `retain()` + individual `insert()` | O(n + m · log n) | ✅ Only overlap dropped | m new nodes |
 | `split_off` + reassign + `extend` **(used)** | **O(log n + k + m · log(n − k))** | ✅ Only overlap (k) dropped | 0 |

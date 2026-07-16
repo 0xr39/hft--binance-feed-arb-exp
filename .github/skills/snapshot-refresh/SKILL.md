@@ -104,8 +104,9 @@ approach decouples the concerns: the WS loop is never blocked by HTTP latency.
 
 ### Snapshot fetch on `LocalOrderBook`
 
-`LocalOrderBook` gets a new method that applies a REST depth snapshot directly
-to itself (instead of the old `from_snapshot` factory approach):
+`LocalOrderBook` applies a REST depth snapshot via `apply_snapshot()`, which
+delegates to `apply()` (handles BBO cache clearing, map clearing, and level
+insertion) followed by `trim_to_max_depth()`:
 
 ```rust
 impl LocalOrderBook {
@@ -114,11 +115,8 @@ impl LocalOrderBook {
     /// from a `RestDepthSnapshot` response.
     pub fn apply_snapshot(&mut self, update: &BookUpdate) {
         assert!(update.is_snapshot);
-        self.bbo_bid = None;
-        self.bbo_ask = None;
-        self.bids.clear();
-        self.asks.clear();
-        // ... insert levels from update.bids / update.asks
+        self.apply(update);  // delegates to apply() which handles clear + insert
+        self.trim_to_max_depth();
     }
 }
 ```

@@ -134,13 +134,12 @@ struct LevelMeta {
 fn diff_update(
     map: &mut BTreeMap<u64, LevelMeta>,
     level: &PriceLevel,
+    tick: u64,
     source: StreamSource,
     exch_ts: i64,
     local_ts: i64,
     delay_ns: i64,
-    tick_size: f64,
 ) {
-    let tick = ((level.price + 1e-9) / tick_size).floor() as u64;
     match map.entry(tick) {
         Entry::Vacant(entry) => {
             if level.qty != 0.0 {
@@ -438,6 +437,7 @@ impl LocalOrderBook {
 
         // ── Depth updates (DiffBookDepth only — PartialBookDepth returned) ──
 
+
         // parallel, not worth it for the overhead, even 1000 bid asks are just ~300 microseconds
         // let tick_size = self.tick_size;
         // let source = update.source;
@@ -457,12 +457,44 @@ impl LocalOrderBook {
         //     },
         // );
 
-        // serial, simpler and faster for small updates
+        // LARGE OVERHEAD
+        // Pre-compute depth thresholds so we can skip levels deeper than
+        // max_depth without inserting them just to trim later.
+
+        // let bid_threshold = self.max_depth.and_then(|md| {
+        //     if self.bids.len() <= md {
+        //         None
+        //     } else {
+        //         self.bids.iter().rev().nth(md - 1).map(|(&t, _)| t)
+        //     }
+        // });
+        // let ask_threshold = self.max_depth.and_then(|md| {
+        //     if self.asks.len() <= md {
+        //         None
+        //     } else {
+        //         self.asks.iter().nth(md - 1).map(|(&t, _)| t)
+        //     }
+        // });
+        // println!("  bid_threshold={:?}, ask_threshold={:?}", bid_threshold, ask_threshold);
+
+        // serial
         for bid in &update.bids {
-            diff_update(&mut self.bids, bid, update.source, update.exch_ts, update.local_ts, update.local_ts - update.exch_ts, self.tick_size);
+            let tick = ((bid.price + 1e-9) / self.tick_size).floor() as u64;
+            // if let Some(threshold) = bid_threshold {
+            //     if tick < threshold {
+            //         continue;
+            //     }
+            // }
+            diff_update(&mut self.bids, bid, tick, update.source, update.exch_ts, update.local_ts, update.local_ts - update.exch_ts);
         }
         for ask in &update.asks {
-            diff_update(&mut self.asks, ask, update.source, update.exch_ts, update.local_ts, update.local_ts - update.exch_ts, self.tick_size);
+            let tick = ((ask.price + 1e-9) / self.tick_size).floor() as u64;
+            // if let Some(threshold) = ask_threshold {
+            //     if tick > threshold {
+            //         continue;
+            //     }
+            // }
+            diff_update(&mut self.asks, ask, tick, update.source, update.exch_ts, update.local_ts, update.local_ts - update.exch_ts);
         }
         
         let elapsed = start.elapsed().as_nanos();
@@ -484,6 +516,7 @@ impl LocalOrderBook {
         // eprintln!("[apply_snapshot] applying snapshot, last_snapshot_ts={}  |  last_exch_ts={}", self.last_snapshot_ts, self.last_exch_ts);
         assert!(update.is_snapshot, "apply_snapshot requires is_snapshot=true");
         self.apply(update);
+        self.trim_to_max_depth();
         // eprintln!("[apply_snapshot] applied snapshot, last_snapshot_ts={}  |  last_exch_ts={}", self.last_snapshot_ts, self.last_exch_ts);
     }
 
@@ -549,6 +582,13 @@ impl LocalOrderBook {
 
     /// Trim bids and asks to at most `max_depth` levels, keeping the best
     /// (closest to the spread) levels on each side. No-op when `max_depth` is `None`.
+    ///
+    /// # Time complexity
+    ///
+    /// O(N) worst-case due to `split_off` re-assembling the discarded half of the
+    /// tree (which is ~N − max_depth elements). In practice `split_off` only moves
+    /// tree node pointers — no per-element copying — and the discarded map is freed
+    /// immediately. The `nth()` lookups are O(log N + max_depth / B).
     fn trim_to_max_depth(&mut self) {
         let Some(max_depth) = self.max_depth else { return };
         if max_depth == 0 {
