@@ -443,6 +443,7 @@ impl StreamReceiver {
                         match parse_book_update(&text, util::now_nanos()) {
                             Ok(update) => {
                                 println!("[dry-run] {text}");
+                                println!("[dry-run] Parsed update: {:?}", update);
                                 let bid_str = if update.bids.is_empty() {
                                     "no bids".into()
                                 } else {

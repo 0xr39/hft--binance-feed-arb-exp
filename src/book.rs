@@ -324,7 +324,7 @@ impl LocalOrderBook {
                 let tick = ((bid.price + 1e-9) / self.tick_size).floor() as u64;
                 self.bbo_bid = Some((tick, LevelMeta {
                     qty: bid.qty,
-                    source: StreamSource::BookTicker,
+                    source: update.source,
                     last_exch_ts: update.exch_ts,
                     last_local_ts: update.local_ts,
                     delay_ns: update.local_ts - update.exch_ts,
@@ -334,13 +334,13 @@ impl LocalOrderBook {
                 let tick = ((ask.price + 1e-9) / self.tick_size).floor() as u64;
                 self.bbo_ask = Some((tick, LevelMeta {
                     qty: ask.qty,
-                    source: StreamSource::BookTicker,
+                    source: update.source,
                     last_exch_ts: update.exch_ts,
                     last_local_ts: update.local_ts,
                     delay_ns: update.local_ts - update.exch_ts,
                 }));
             }
-            // No BTreeMap interaction — BBO cache only.
+
             let elapsed = start.elapsed().as_nanos();
             self.timing_log.borrow_mut().push(TimingRecord {
                 elapsed_ns: elapsed,
@@ -350,24 +350,30 @@ impl LocalOrderBook {
                 exch_ts: update.exch_ts,
                 local_ts: update.local_ts,
             });
+            // No BTreeMap interaction — BBO cache only.
             return;
-        } else {
-            // if bbo is not empty, last update is a book ticker, then put bbo into the book, and clear it
-            if let Some((bbo_tick, bbo_meta)) = self.bbo_bid {
-                store(&mut self.bids, &PriceLevel {
-                    price: bbo_tick as f64 * self.tick_size,
-                    qty: bbo_meta.qty,
-                }, StreamSource::BookTicker, bbo_meta.last_exch_ts, bbo_meta.last_local_ts, bbo_meta.delay_ns, self.tick_size);
+        } else if matches!(update.source, StreamSource::PartialBookDepth { .. }) {
+            // update BBO cache for partial book depth updates, since they provide the top of the book in sorted order
+            if let Some(bid) = update.bids.first() {
+                let tick = ((bid.price + 1e-9) / self.tick_size).floor() as u64;
+                self.bbo_bid = Some((tick, LevelMeta {
+                    qty: bid.qty,
+                    source: update.source,
+                    last_exch_ts: update.exch_ts,
+                    last_local_ts: update.local_ts,
+                    delay_ns: update.local_ts - update.exch_ts,
+                }));
             }
-            self.bbo_bid = None;
-
-            if let Some((bbo_tick, bbo_meta)) = self.bbo_ask {
-                store(&mut self.asks, &PriceLevel {
-                    price: bbo_tick as f64 * self.tick_size,
-                    qty: bbo_meta.qty,
-                }, StreamSource::BookTicker, bbo_meta.last_exch_ts, bbo_meta.last_local_ts, bbo_meta.delay_ns, self.tick_size);
+            if let Some(ask) = update.asks.first() {
+                let tick = ((ask.price + 1e-9) / self.tick_size).floor() as u64;
+                self.bbo_ask = Some((tick, LevelMeta {
+                    qty: ask.qty,
+                    source: update.source,
+                    last_exch_ts: update.exch_ts,
+                    last_local_ts: update.local_ts,
+                    delay_ns: update.local_ts - update.exch_ts,
+                }));
             }
-            self.bbo_ask = None;
         }
 
         // ── Depth updates (DiffBookDepth | PartialBookDepth) ───────────
@@ -500,32 +506,23 @@ impl LocalOrderBook {
         let best_tick = self.best_ask_tick();
 
         let mut print_lines: Vec<String> = Vec::new();
-        if self.last_update_source == Some(StreamSource::BookTicker) {
-            // Push BBO first so it lands last after .rev() (bottom of asks display).
-            if let Some((tick, meta)) = self.bbo_ask {
-                let price = tick as f64 * self.tick_size;
-                print_lines.push(format!(
-                    "  {:.10} @ {:.10} delay={}ms, last_source=book_ticker",
-                    meta.qty, price, delay_ms,
-                ));
-            }
+        // Push BBO first so it lands last after .rev() (bottom of asks display).
+        if let Some((tick, meta)) = self.bbo_ask {
+            let price = tick as f64 * self.tick_size;
+            print_lines.push(format!(
+                "  {:.10} @ {:.10} delay={}ms, last_source={}",
+                meta.qty, price, delay_ms, meta.source
+            ));
+        }
 
-            for (_tick, meta) in asks {
-                if print_lines.len() > depth.unwrap_or(usize::MAX)-1 { break; }
-                let price = *_tick as f64 * self.tick_size;
-                if Some(_tick) > best_tick.as_ref() {
-                    print_lines.push(format!("  {:.10} @ {:.10}  data_age={}ms, delay={}ms, last_source={}", meta.qty, price, (self.last_local_ts - meta.last_local_ts) / 1_000_000, meta.delay_ns / 1_000_000, meta.source));
-                }
-            }
-        } else {
-            for (_tick, meta) in asks {
-                if print_lines.len() > depth.unwrap_or(usize::MAX)-1 { break; }
-                let price = *_tick as f64 * self.tick_size;
-                if Some(_tick) >= best_tick.as_ref() {
-                    print_lines.push(format!("  {:.10} @ {:.10}  data_age={}ms, delay={}ms, last_source={}", meta.qty, price, (self.last_local_ts - meta.last_local_ts) / 1_000_000, meta.delay_ns / 1_000_000, meta.source));
-                }
+        for (_tick, meta) in asks {
+            if print_lines.len() > depth.unwrap_or(usize::MAX)-1 { break; }
+            let price = *_tick as f64 * self.tick_size;
+            if Some(_tick) > best_tick.as_ref() {
+                print_lines.push(format!("  {:.10} @ {:.10}  data_age={}ms, delay={}ms, last_source={}", meta.qty, price, (self.last_local_ts - meta.last_local_ts) / 1_000_000, meta.delay_ns / 1_000_000, meta.source));
             }
         }
+
         for line in print_lines.iter().rev() {
             writeln!(f, "{line}")?;
         }
@@ -539,34 +536,25 @@ impl LocalOrderBook {
 
         let bids = self.bids.iter().rev();
         let best_tick = self.best_bid_tick();
-        if self.last_update_source == Some(StreamSource::BookTicker) {
-            if let Some((tick, meta)) = self.bbo_bid {
-                let price = tick as f64 * self.tick_size;
-                writeln!(
-                    f,
-                    "  {:.10} @ {:.10}  delay={}ms, last_source=book_ticker",
-                    meta.qty, price, delay_ms,
-                )?;
-            }
+        
+        if let Some((tick, meta)) = self.bbo_bid {
+            let price = tick as f64 * self.tick_size;
+            writeln!(
+                f,
+                "  {:.10} @ {:.10}  delay={}ms, last_source={}",
+                meta.qty, price, delay_ms, meta.source
+            )?;
+        }
 
-            for (_tick, meta) in bids {
-                if print_counter > depth.unwrap_or(usize::MAX)-1 { break; }
-                let price = *_tick as f64 * self.tick_size;
-                if Some(_tick) < best_tick.as_ref() {
-                    writeln!(f, "  {:.10} @ {:.10}  data_age={}ms, delay={}ms, last_source={}", meta.qty, price, (self.last_local_ts - meta.last_local_ts) / 1_000_000, meta.delay_ns / 1_000_000, meta.source)?;
-                    print_counter += 1;
-                }
-            }
-        } else {
-            for (_tick, meta) in bids {
-                if print_counter > depth.unwrap_or(usize::MAX)-1 { break; }
-                let price = *_tick as f64 * self.tick_size;
-                if Some(_tick) <= best_tick.as_ref() {
-                    writeln!(f, "  {:.10} @ {:.10}  data_age={}ms, delay={}ms, last_source={}", meta.qty, price, (self.last_local_ts - meta.last_local_ts) / 1_000_000, meta.delay_ns / 1_000_000, meta.source)?;
-                    print_counter += 1;
-                }
+        for (_tick, meta) in bids {
+            if print_counter > depth.unwrap_or(usize::MAX)-1 { break; }
+            let price = *_tick as f64 * self.tick_size;
+            if Some(_tick) < best_tick.as_ref() {
+                writeln!(f, "  {:.10} @ {:.10}  data_age={}ms, delay={}ms, last_source={}", meta.qty, price, (self.last_local_ts - meta.last_local_ts) / 1_000_000, meta.delay_ns / 1_000_000, meta.source)?;
+                print_counter += 1;
             }
         }
+
         Ok(())
     }
 }
@@ -574,24 +562,13 @@ impl LocalOrderBook {
 impl std::fmt::Display for LocalOrderBook {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "── {} ──", self.symbol)?;
-        // BBO cache (only shown when the last update was a BookTicker).
-        if self.last_update_source == Some(StreamSource::BookTicker) {
-            if let Some((tick, meta)) = self.bbo_bid {
-                let price = tick as f64 * self.tick_size;
-                writeln!(f, "  BBO bid: {:.1} @ {:.1}  (book_ticker)", meta.qty, price)?;
-            }
-            if let Some((tick, meta)) = self.bbo_ask {
-                let price = tick as f64 * self.tick_size;
-                writeln!(f, "  BBO ask: {:.1} @ {:.1}  (book_ticker)", meta.qty, price)?;
-            }
-        } else {
-            if let Some(bid) = self.best_bid() {
-                writeln!(f, "  BBO bid: {:.1} @ {:.1} ", bid.qty, bid.price)?;
-            }
-            if let Some(ask) = self.best_ask() {
-                writeln!(f, "  BBO ask: {:.1} @ {:.1} ", ask.qty, ask.price)?;
-            }
+        if let Some(bid) = self.best_bid() {
+            writeln!(f, "  BBO bid: {:.1} @ {:.1} ", bid.qty, bid.price)?;
         }
+        if let Some(ask) = self.best_ask() {
+            writeln!(f, "  BBO ask: {:.1} @ {:.1} ", ask.qty, ask.price)?;
+        }
+    
         writeln!(
             f,
             "  Asks ({}) | Bids ({}), latest update: {}",

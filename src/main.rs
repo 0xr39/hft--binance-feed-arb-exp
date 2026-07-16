@@ -73,10 +73,10 @@ async fn stream_dry_run() {
 
     let configs = vec![
         StreamConfig::book_ticker(SYMBOL),
+        StreamConfig::partial_depth(SYMBOL, 5, 100),
+        StreamConfig::partial_depth(SYMBOL, 10, 100),
         StreamConfig::partial_depth(SYMBOL, 20, 100),
-        StreamConfig::partial_depth(SYMBOL, 20, 250),
         StreamConfig::diff_depth(SYMBOL, 100),
-        StreamConfig::diff_depth(SYMBOL, 250),
     ];
 
     let receiver = StreamReceiver::new(
