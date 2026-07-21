@@ -10,7 +10,7 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::book::{BookUpdate, LocalOrderBook, PriceLevel};
-pub(crate) use crate::util::parse_levels;
+use crate::util::parse_levels;
 
 // ---------------------------------------------------------------------------
 // Stream source identification
