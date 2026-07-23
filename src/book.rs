@@ -572,8 +572,8 @@ impl LocalOrderBook {
             use std::fmt::Write;
             let _ = write!(
                 buf,
-                "[apply] {:>6} ns  |  {} bids, {} asks  |  source={} | delay={} ms \n",
-                rec.elapsed_ns, rec.bids, rec.asks, rec.source, (rec.local_ts - rec.exch_ts) / 1_000_000
+                "[apply] {:>6} ns  |  {} bids, {} asks  |  source={} | delay={:.3}µs \n",
+                rec.elapsed_ns, rec.bids, rec.asks, rec.source, (rec.local_ts - rec.exch_ts) as f64 / 1000.0
             );
         }
         eprintln!("{buf}");
@@ -630,8 +630,8 @@ impl LocalOrderBook {
                 "  {:.10} @ {:.10}  data_age={:.3}µs, delay={:.3}µs, last_source={}",
                 meta.qty,
                 price,
-                (self.last_local_ts - meta.last_local_ts) / 1_000,
-                meta.delay_ns / 1_000,
+                (self.last_local_ts - meta.last_local_ts) as f64 / 1000.0,
+                meta.delay_ns as f64 / 1000.0,
                 meta.source
             ));
         }
@@ -646,8 +646,8 @@ impl LocalOrderBook {
                     "  {:.10} @ {:.10}  data_age={:.3}µs, delay={:.3}µs, last_source={}",
                     meta.qty,
                     price,
-                    (self.last_local_ts - meta.last_local_ts) / 1_000,
-                    meta.delay_ns / 1_000,
+                    (self.last_local_ts - meta.last_local_ts) as f64 / 1000.0,
+                    meta.delay_ns as f64 / 1000.0,
                     meta.source
                 ));
             }
@@ -671,15 +671,29 @@ impl LocalOrderBook {
             writeln!(
                 f,
                 "  {:.10} @ {:.10}  data_age={:.3}µs, delay={:.3}µs, last_source={}",
-                meta.qty, price, (self.last_local_ts - meta.last_local_ts) / 1_000, meta.delay_ns / 1_000, meta.source
+                meta.qty,
+                price,
+                (self.last_local_ts - meta.last_local_ts) as f64 / 1000.0,
+                meta.delay_ns as f64 / 1000.0,
+                meta.source
             )?;
         }
 
         for (_tick, meta) in bids {
-            if print_counter > depth.unwrap_or(usize::MAX)-1 { break; }
+            if print_counter > depth.unwrap_or(usize::MAX) - 1 {
+                break;
+            }
             let price = *_tick as f64 * self.tick_size;
             if Some(_tick) < best_tick.as_ref() {
-                writeln!(f, "  {:.10} @ {:.10}  data_age={:.3}µs, delay={:.3}µs, last_source={}", meta.qty, price, (self.last_local_ts - meta.last_local_ts) / 1_000, meta.delay_ns / 1_000, meta.source)?;
+                writeln!(
+                    f,
+                    "  {:.10} @ {:.10}  data_age={:.3}µs, delay={:.3}µs, last_source={}",
+                    meta.qty,
+                    price,
+                    (self.last_local_ts - meta.last_local_ts) as f64 / 1000.0,
+                    meta.delay_ns as f64 / 1000.0,
+                    meta.source
+                )?;
                 print_counter += 1;
             }
         }
