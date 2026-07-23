@@ -619,8 +619,6 @@ impl LocalOrderBook {
 impl LocalOrderBook {
     /// Write ask levels with delay info to a formatter, up to `depth` levels.
     fn log_write_asks(&self, f: &mut std::fmt::Formatter<'_>, depth: Option<usize>) -> std::fmt::Result {
-        let delay_ms = (self.last_local_ts - self.last_exch_ts) / 1_000_000;
-
         let asks = self.asks.iter();
         let best_tick = self.best_ask_tick();
 
@@ -629,16 +627,29 @@ impl LocalOrderBook {
         if let Some((tick, meta)) = self.bbo_ask {
             let price = tick as f64 * self.tick_size;
             print_lines.push(format!(
-                "  {:.10} @ {:.10}  data_age={}ms, delay={}ms, last_source={}",
-                meta.qty, price, (self.last_local_ts - meta.last_local_ts) / 1_000_000, delay_ms, meta.source
+                "  {:.10} @ {:.10}  data_age={:.3}µs, delay={:.3}µs, last_source={}",
+                meta.qty,
+                price,
+                (self.last_local_ts - meta.last_local_ts) / 1_000,
+                meta.delay_ns / 1_000,
+                meta.source
             ));
         }
 
         for (_tick, meta) in asks {
-            if print_lines.len() > depth.unwrap_or(usize::MAX)-1 { break; }
+            if print_lines.len() > depth.unwrap_or(usize::MAX) - 1 {
+                break;
+            }
             let price = *_tick as f64 * self.tick_size;
             if Some(_tick) > best_tick.as_ref() {
-                print_lines.push(format!("  {:.10} @ {:.10}  data_age={}ms, delay={}ms, last_source={}", meta.qty, price, (self.last_local_ts - meta.last_local_ts) / 1_000_000, meta.delay_ns / 1_000_000, meta.source));
+                print_lines.push(format!(
+                    "  {:.10} @ {:.10}  data_age={:.3}µs, delay={:.3}µs, last_source={}",
+                    meta.qty,
+                    price,
+                    (self.last_local_ts - meta.last_local_ts) / 1_000,
+                    meta.delay_ns / 1_000,
+                    meta.source
+                ));
             }
         }
 
@@ -650,7 +661,6 @@ impl LocalOrderBook {
 
     /// Write bid levels with delay info to a formatter, up to `depth` levels.
     fn log_write_bids(&self, f: &mut std::fmt::Formatter<'_>, depth: Option<usize>) -> std::fmt::Result {
-        let delay_ms = (self.last_local_ts - self.last_exch_ts) / 1_000_000;
         let mut print_counter: usize = 0;
 
         let bids = self.bids.iter().rev();
@@ -660,8 +670,8 @@ impl LocalOrderBook {
             let price = tick as f64 * self.tick_size;
             writeln!(
                 f,
-                "  {:.10} @ {:.10}  data_age={}ms, delay={}ms, last_source={}",
-                meta.qty, price, (self.last_local_ts - meta.last_local_ts) / 1_000_000, delay_ms, meta.source
+                "  {:.10} @ {:.10}  data_age={:.3}µs, delay={:.3}µs, last_source={}",
+                meta.qty, price, (self.last_local_ts - meta.last_local_ts) / 1_000, meta.delay_ns / 1_000, meta.source
             )?;
         }
 
@@ -669,7 +679,7 @@ impl LocalOrderBook {
             if print_counter > depth.unwrap_or(usize::MAX)-1 { break; }
             let price = *_tick as f64 * self.tick_size;
             if Some(_tick) < best_tick.as_ref() {
-                writeln!(f, "  {:.10} @ {:.10}  data_age={}ms, delay={}ms, last_source={}", meta.qty, price, (self.last_local_ts - meta.last_local_ts) / 1_000_000, meta.delay_ns / 1_000_000, meta.source)?;
+                writeln!(f, "  {:.10} @ {:.10}  data_age={:.3}µs, delay={:.3}µs, last_source={}", meta.qty, price, (self.last_local_ts - meta.last_local_ts) / 1_000, meta.delay_ns / 1_000, meta.source)?;
                 print_counter += 1;
             }
         }
