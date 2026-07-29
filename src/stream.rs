@@ -510,7 +510,7 @@ impl StreamReceiver {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
-                match crate::book::fetch_depth_snapshot(&full_rest_url).await {
+                match fetch_depth_snapshot(&full_rest_url).await {
                     Ok(update) => {
                         // try_lock — never block the WS loop.
                         if let Ok(mut guard) = snapshot_book.try_lock() {
@@ -594,6 +594,53 @@ impl StreamReceiver {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// REST snapshot types and fetch
+// ---------------------------------------------------------------------------
+
+/// REST depth snapshot response from Binance (`GET /fapi/v1/depth` or `GET /api/v3/depth`).
+#[derive(Deserialize)]
+struct RestDepthSnapshot {
+    #[serde(rename = "lastUpdateId")]
+    last_update_id: u64,
+    #[serde(rename = "T")]
+    transaction_time: i64,
+    bids: Vec<[String; 2]>,
+    asks: Vec<[String; 2]>,
+}
+
+
+/// Fetch a REST depth snapshot from a pre-built URL and return a `BookUpdate`
+/// with `is_snapshot: true`.
+pub async fn fetch_depth_snapshot(full_url: &str) -> Result<BookUpdate, crate::util::HttpError> {
+    let resp: RestDepthSnapshot = reqwest::get(full_url).await?.json().await?;
+
+    let local_ts = crate::util::now_nanos();
+    let exch_ts = resp.transaction_time * 1_000_000;
+
+    Ok(BookUpdate {
+        source: StreamSource::Snapshot, 
+        exch_ts,
+        local_ts,
+        bids: parse_levels(&resp.bids),
+        asks: parse_levels(&resp.asks),
+        is_snapshot: true,
+    })
+}
+
+pub async fn build_book_from_snapshot(
+    symbol: impl Into<String>,
+    tick_size: f64,
+    lot_size: f64,
+    max_depth: Option<usize>,
+    full_url: &str,
+) -> Result<LocalOrderBook, crate::util::HttpError> {
+    let update = fetch_depth_snapshot(full_url).await?;
+    let mut book = LocalOrderBook::new(symbol, tick_size, lot_size, max_depth);
+    book.apply_snapshot(&update);
+    Ok(book)
 }
 
 // ---------------------------------------------------------------------------

@@ -3,13 +3,7 @@ use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
 use std::time::Instant;
 
-use rayon::join;
-use serde::Deserialize;
-
-use crate::util;
-use crate::util::parse_levels;
-
-pub use crate::stream::StreamSource;
+use crate::stream::{StreamSource};
 
 // ---------------------------------------------------------------------------
 // Price level
@@ -77,10 +71,12 @@ pub struct LocalOrderBook {
     pub max_depth: Option<usize>,
 
     // --- Book state -------------------------------------------------------
-    /// Cached best bid (tick, metadata) from BookTicker stream.
-    bbo_bid: Option<(u64, LevelMeta)>,
-    /// Cached best ask (tick, metadata) from BookTicker stream.
-    bbo_ask: Option<(u64, LevelMeta)>,
+    /// Cached best bid from BookTicker / TopOfBook streams.
+    /// Stores the original exchange price for accurate display even when
+    /// tick_size rounding would collapse multiple distinct BBO levels into one.
+    bbo_bid: Option<BboEntry>,
+    /// Cached best ask from BookTicker / TopOfBook streams.
+    bbo_ask: Option<BboEntry>,
     
     bids: BTreeMap<u64, LevelMeta>,   // price in ticks -> metadata
     asks: BTreeMap<u64, LevelMeta>,   // price in ticks -> metadata
@@ -125,6 +121,15 @@ struct LevelMeta {
     last_local_ts: i64,
     /// Network delay at the time of apply: now - exch_ts (ns).
     delay_ns: i64,
+}
+
+/// Cached BBO entry — stores the tick-rounded key for BTree lookups,
+/// the original exchange price for accurate display, and metadata.
+#[derive(Debug, Clone, Copy)]
+struct BboEntry {
+    tick: u64,
+    original_price: f64,
+    meta: LevelMeta,
 }
 
 /// Insert, update, or remove a single level in one of the depth maps.
@@ -197,9 +202,9 @@ impl LocalOrderBook {
 
     pub fn best_bid(&self) -> Option<PriceLevel> {
         self.bbo_bid
-            .map(|(tick, m)| PriceLevel {
-                price: tick as f64 * self.tick_size,
-                qty: m.qty,
+            .map(|e| PriceLevel {
+                price: e.original_price,
+                qty: e.meta.qty,
             })
             .or_else(|| {
                 self.bids.last_key_value().map(|(tick, m)| PriceLevel {
@@ -211,15 +216,15 @@ impl LocalOrderBook {
 
     pub fn best_bid_tick(&self) -> Option<u64> {
         self.bbo_bid
-            .map(|(tick, _)| tick)
+            .map(|e| e.tick)
             .or_else(|| self.bids.last_key_value().map(|(tick, _)| *tick))
     }
 
     pub fn best_ask(&self) -> Option<PriceLevel> {
         self.bbo_ask
-            .map(|(tick, m)| PriceLevel {
-                price: tick as f64 * self.tick_size,
-                qty: m.qty,
+            .map(|e| PriceLevel {
+                price: e.original_price,
+                qty: e.meta.qty,
             })
             .or_else(|| {
                 self.asks.first_key_value().map(|(tick, m)| PriceLevel {
@@ -231,7 +236,7 @@ impl LocalOrderBook {
 
     pub fn best_ask_tick(&self) -> Option<u64> {
         self.bbo_ask
-            .map(|(tick, _)| tick)
+            .map(|e| e.tick)
             .or_else(|| self.asks.first_key_value().map(|(tick, _)| *tick))
     }
 
@@ -249,29 +254,19 @@ impl LocalOrderBook {
         })
     }
 
-    /// The stream source of the most recently applied update.
-    pub fn last_source(&self) -> Option<StreamSource> {
-        self.last_update_source
-    }
-
-    /// Total number of updates applied since the book was created.
-    pub fn update_count(&self) -> u64 {
-        self.update_count
-    }
-
     /// Query which stream last updated a specific price level.
     /// Checks the BBO cache first, then the depth trees.
     pub fn source_at_price(&self, price: f64) -> Option<StreamSource> {
         let tick = ((price + 1e-9) / self.tick_size).floor() as u64;
         // Check BBO cache first (tick match).
-        if let Some((bbo_tick, _)) = self.bbo_bid {
-            if bbo_tick == tick {
-                return Some(StreamSource::BookTicker);
+        if let Some(e) = &self.bbo_bid {
+            if e.tick == tick {
+                return Some(e.meta.source)
             }
         }
-        if let Some((bbo_tick, _)) = self.bbo_ask {
-            if bbo_tick == tick {
-                return Some(StreamSource::BookTicker);
+        if let Some(e) = &self.bbo_ask {
+            if e.tick == tick {
+                return Some(e.meta.source)
             }
         }
         // Fallback to depth trees.
@@ -325,57 +320,73 @@ impl LocalOrderBook {
         } else if update.source == StreamSource::BookTicker {
             if let Some(bid) = update.bids.first() {
                 let tick = ((bid.price + 1e-9) / self.tick_size).floor() as u64;
-                self.bbo_bid = Some((tick, LevelMeta {
-                    qty: bid.qty,
-                    source: update.source,
-                    last_exch_ts: update.exch_ts,
-                    last_local_ts: update.local_ts,
-                    delay_ns: update.local_ts - update.exch_ts,
-                }));
+                self.bbo_bid = Some(BboEntry {
+                    tick,
+                    original_price: bid.price,
+                    meta: LevelMeta {
+                        qty: bid.qty,
+                        source: update.source,
+                        last_exch_ts: update.exch_ts,
+                        last_local_ts: update.local_ts,
+                        delay_ns: update.local_ts - update.exch_ts,
+                    },
+                });
             }
             if let Some(ask) = update.asks.first() {
                 let tick = ((ask.price + 1e-9) / self.tick_size).floor() as u64;
-                self.bbo_ask = Some((tick, LevelMeta {
-                    qty: ask.qty,
-                    source: update.source,
-                    last_exch_ts: update.exch_ts,
-                    last_local_ts: update.local_ts,
-                    delay_ns: update.local_ts - update.exch_ts,
-                }));
+                self.bbo_ask = Some(BboEntry {
+                    tick,
+                    original_price: ask.price,
+                    meta: LevelMeta {
+                        qty: ask.qty,
+                        source: update.source,
+                        last_exch_ts: update.exch_ts,
+                        last_local_ts: update.local_ts,
+                        delay_ns: update.local_ts - update.exch_ts,
+                    },
+                });
             }
 
-            let elapsed = start.elapsed().as_nanos();
-            self.timing_log.borrow_mut().push(TimingRecord {
-                elapsed_ns: elapsed,
-                bids: update.bids.len() as u32,
-                asks: update.asks.len() as u32,
-                source: update.source,
-                exch_ts: update.exch_ts,
-                local_ts: update.local_ts,
-            });
+            // let elapsed = start.elapsed().as_nanos();
+            // self.timing_log.borrow_mut().push(TimingRecord {
+            //     elapsed_ns: elapsed,
+            //     bids: update.bids.len() as u32,
+            //     asks: update.asks.len() as u32,
+            //     source: update.source,
+            //     exch_ts: update.exch_ts,
+            //     local_ts: update.local_ts,
+            // });
             // No BTreeMap interaction — BBO cache only.
             return;
-        } else if matches!(update.source, StreamSource::PartialBookDepth { .. }) {
+        } else if matches!(update.source, StreamSource::PartialBookDepth{..}) {
             // update BBO cache for partial book depth updates, since they provide the top of the book in sorted order
             if let Some(bid) = update.bids.first() {
                 let tick = ((bid.price + 1e-9) / self.tick_size).floor() as u64;
-                self.bbo_bid = Some((tick, LevelMeta {
-                    qty: bid.qty,
-                    source: update.source,
-                    last_exch_ts: update.exch_ts,
-                    last_local_ts: update.local_ts,
-                    delay_ns: update.local_ts - update.exch_ts,
-                }));
+                self.bbo_bid = Some(BboEntry {
+                    tick,
+                    original_price: bid.price,
+                    meta: LevelMeta {
+                        qty: bid.qty,
+                        source: update.source,
+                        last_exch_ts: update.exch_ts,
+                        last_local_ts: update.local_ts,
+                        delay_ns: update.local_ts - update.exch_ts,
+                    },
+                });
             }
             if let Some(ask) = update.asks.first() {
                 let tick = ((ask.price + 1e-9) / self.tick_size).floor() as u64;
-                self.bbo_ask = Some((tick, LevelMeta {
-                    qty: ask.qty,
-                    source: update.source,
-                    last_exch_ts: update.exch_ts,
-                    last_local_ts: update.local_ts,
-                    delay_ns: update.local_ts - update.exch_ts,
-                }));
+                self.bbo_ask = Some(BboEntry {
+                    tick,
+                    original_price: ask.price,
+                    meta: LevelMeta {
+                        qty: ask.qty,
+                        source: update.source,
+                        last_exch_ts: update.exch_ts,
+                        last_local_ts: update.local_ts,
+                        delay_ns: update.local_ts - update.exch_ts,
+                    },
+                });
             }
 
             // ── Bulk-replace: split_off overlap + extend fresh levels ──
@@ -423,16 +434,25 @@ impl LocalOrderBook {
                 );
             }
 
-            let elapsed = start.elapsed().as_nanos();
-            self.timing_log.borrow_mut().push(TimingRecord {
-                elapsed_ns: elapsed,
-                exch_ts: update.exch_ts,
-                local_ts: update.local_ts,
-                bids: update.bids.len() as u32,
-                asks: update.asks.len() as u32,
-                source: update.source,
-            });
+            // let elapsed = start.elapsed().as_nanos();
+            // self.timing_log.borrow_mut().push(TimingRecord {
+            //     elapsed_ns: elapsed,
+            //     exch_ts: update.exch_ts,
+            //     local_ts: update.local_ts,
+            //     bids: update.bids.len() as u32,
+            //     asks: update.asks.len() as u32,
+            //     source: update.source,
+            // });
             return;  // skip store() loop below
+        } else {
+            // DiffBookDepth: flush BBO cache into BTreeMap before applying diffs,
+            // so the depth tree always reflects the latest BBO state.
+            if let Some(e) = self.bbo_bid.take() {
+                self.bids.insert(e.tick, e.meta);
+            }
+            if let Some(e) = self.bbo_ask.take() {
+                self.asks.insert(e.tick, e.meta);
+            }
         }
 
         // ── Depth updates (DiffBookDepth only — PartialBookDepth returned) ──
@@ -497,15 +517,15 @@ impl LocalOrderBook {
             diff_update(&mut self.asks, ask, tick, update.source, update.exch_ts, update.local_ts, update.local_ts - update.exch_ts);
         }
         
-        let elapsed = start.elapsed().as_nanos();
-        self.timing_log.borrow_mut().push(TimingRecord {
-            elapsed_ns: elapsed,
-            exch_ts: update.exch_ts,
-            local_ts: update.local_ts,
-            bids: update.bids.len() as u32,
-            asks: update.asks.len() as u32,
-            source: update.source,
-        });
+        // let elapsed = start.elapsed().as_nanos();
+        // self.timing_log.borrow_mut().push(TimingRecord {
+        //     elapsed_ns: elapsed,
+        //     exch_ts: update.exch_ts,
+        //     local_ts: update.local_ts,
+        //     bids: update.bids.len() as u32,
+        //     asks: update.asks.len() as u32,
+        //     source: update.source,
+        // });
     }
 
     /// Apply a snapshot `BookUpdate` to this book.
@@ -518,20 +538,6 @@ impl LocalOrderBook {
         self.apply(update);
         self.trim_to_max_depth();
         // eprintln!("[apply_snapshot] applied snapshot, last_snapshot_ts={}  |  last_exch_ts={}", self.last_snapshot_ts, self.last_exch_ts);
-    }
-
-    /// Create a book pre-populated from a REST depth snapshot.
-    pub async fn from_snapshot(
-        symbol: impl Into<String>,
-        tick_size: f64,
-        lot_size: f64,
-        max_depth: Option<usize>,
-        full_url: &str,
-    ) -> Result<Self, SnapshotError> {
-        let update = fetch_depth_snapshot(full_url).await?;
-        let mut book = Self::new(symbol, tick_size, lot_size, max_depth);
-        book.apply_snapshot(&update);
-        Ok(book)
     }
 
     // -----------------------------------------------------------------------
@@ -619,29 +625,29 @@ impl LocalOrderBook {
 impl LocalOrderBook {
     /// Write ask levels with delay info to a formatter, up to `depth` levels.
     fn log_write_asks(&self, f: &mut std::fmt::Formatter<'_>, depth: Option<usize>) -> std::fmt::Result {
-        let asks = self.asks.iter();
-        let best_tick = self.best_ask_tick();
+        let asks: std::collections::btree_map::Iter<'_, u64, LevelMeta> = self.asks.iter();
 
         let mut print_lines: Vec<String> = Vec::new();
         // Push BBO first so it lands last after .rev() (bottom of asks display).
-        if let Some((tick, meta)) = self.bbo_ask {
-            let price = tick as f64 * self.tick_size;
+        if let Some(ref e) = self.bbo_ask {
+            let price = e.original_price;
             print_lines.push(format!(
                 "  {:.10} @ {:.10}  data_age={:.3}µs, delay={:.3}µs, last_source={}",
-                meta.qty,
+                e.meta.qty,
                 price,
-                (self.last_local_ts - meta.last_local_ts) as f64 / 1000.0,
-                meta.delay_ns as f64 / 1000.0,
-                meta.source
+                (self.last_local_ts - e.meta.last_local_ts) as f64 / 1000.0,
+                e.meta.delay_ns as f64 / 1000.0,
+                e.meta.source
             ));
         }
 
+        let best_tick = self.best_ask_tick();
         for (_tick, meta) in asks {
             if print_lines.len() > depth.unwrap_or(usize::MAX) - 1 {
                 break;
             }
             let price = *_tick as f64 * self.tick_size;
-            if Some(_tick) > best_tick.as_ref() {
+            if best_tick.map_or(false, |bt| *_tick > bt || (self.bbo_ask.is_none() && *_tick >= bt)) {
                 print_lines.push(format!(
                     "  {:.10} @ {:.10}  data_age={:.3}µs, delay={:.3}µs, last_source={}",
                     meta.qty,
@@ -665,17 +671,17 @@ impl LocalOrderBook {
 
         let bids = self.bids.iter().rev();
         let best_tick = self.best_bid_tick();
-        
-        if let Some((tick, meta)) = self.bbo_bid {
-            let price = tick as f64 * self.tick_size;
+
+        if let Some(ref e) = self.bbo_bid {
+            let price = e.original_price;
             writeln!(
                 f,
                 "  {:.10} @ {:.10}  data_age={:.3}µs, delay={:.3}µs, last_source={}",
-                meta.qty,
+                e.meta.qty,
                 price,
-                (self.last_local_ts - meta.last_local_ts) as f64 / 1000.0,
-                meta.delay_ns as f64 / 1000.0,
-                meta.source
+                (self.last_local_ts - e.meta.last_local_ts) as f64 / 1000.0,
+                e.meta.delay_ns as f64 / 1000.0,
+                e.meta.source
             )?;
         }
 
@@ -684,7 +690,7 @@ impl LocalOrderBook {
                 break;
             }
             let price = *_tick as f64 * self.tick_size;
-            if Some(_tick) < best_tick.as_ref() {
+            if best_tick.map_or(false, |bt| *_tick < bt || (self.bbo_bid.is_none() && *_tick <= bt)) {
                 writeln!(
                     f,
                     "  {:.10} @ {:.10}  data_age={:.3}µs, delay={:.3}µs, last_source={}",
@@ -719,8 +725,8 @@ impl std::fmt::Display for LocalOrderBook {
             self.bid_depth(),
             self.last_update_source.as_ref().map_or_else(|| "none".into(), |s| s.to_string())
         )?;
-        if let Some(src) = self.last_source() {
-            writeln!(f, "  Last update: {src} ({})", self.update_count())?;
+        if let Some(src) = self.last_update_source {
+            writeln!(f, "  Last update: {src} ({})", self.update_count)?;
         }
         // All asks (printed first)
         self.log_write_asks(f, f.precision())?;
@@ -731,70 +737,6 @@ impl std::fmt::Display for LocalOrderBook {
     }
 }
 
-// ---------------------------------------------------------------------------
-// REST snapshot types and fetch
-// ---------------------------------------------------------------------------
-
-/// REST depth snapshot response from Binance (`GET /fapi/v1/depth` or `GET /api/v3/depth`).
-#[derive(Deserialize)]
-struct RestDepthSnapshot {
-    #[serde(rename = "lastUpdateId")]
-    last_update_id: u64,
-    #[serde(rename = "T")]
-    transaction_time: i64,
-    bids: Vec<[String; 2]>,
-    asks: Vec<[String; 2]>,
-}
-
-/// Errors that can occur during REST snapshot fetch.
-#[derive(Debug)]
-pub enum SnapshotError {
-    /// HTTP request failure.
-    Http(String),
-    /// JSON parse failure.
-    Json(String),
-}
-
-impl std::fmt::Display for SnapshotError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Http(msg) => write!(f, "HTTP error: {msg}"),
-            Self::Json(msg) => write!(f, "JSON error: {msg}"),
-        }
-    }
-}
-
-impl std::error::Error for SnapshotError {}
-
-impl From<reqwest::Error> for SnapshotError {
-    fn from(e: reqwest::Error) -> Self {
-        Self::Http(e.to_string())
-    }
-}
-
-impl From<serde_json::Error> for SnapshotError {
-    fn from(e: serde_json::Error) -> Self {
-        Self::Json(e.to_string())
-    }
-}
-
-/// Fetch a REST depth snapshot from a pre-built URL and return a `BookUpdate`
-/// with `is_snapshot: true`.
-pub async fn fetch_depth_snapshot(full_url: &str) -> Result<BookUpdate, SnapshotError> {
-    let resp: RestDepthSnapshot = reqwest::get(full_url).await?.json().await?;
-
-    let local_ts = crate::util::now_nanos();
-    let exch_ts = resp.transaction_time * 1_000_000;
-
-    Ok(BookUpdate {
-        source: crate::stream::StreamSource::Snapshot,
-        exch_ts,
-        local_ts,
-        bids: parse_levels(&resp.bids),
-        asks: parse_levels(&resp.asks),
-        is_snapshot: true,
-    })
-}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -883,6 +825,6 @@ mod tests {
         });
 
         assert_eq!(book.source_at_price(100.0), Some(StreamSource::BookTicker));
-        assert_eq!(book.last_source(), Some(StreamSource::BookTicker));
+        assert_eq!(book.last_update_source, Some(StreamSource::BookTicker));
     }
 }
