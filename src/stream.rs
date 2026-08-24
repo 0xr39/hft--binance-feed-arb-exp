@@ -200,6 +200,8 @@ pub enum StreamError {
     WsRead(String),
     /// JSON parse failure.
     JsonParse(String),
+    /// Numeric field parse failure.
+    Parse(String),
     /// Unknown or unsupported stream name.
     UnknownStream(String),
 }
@@ -210,6 +212,7 @@ impl std::fmt::Display for StreamError {
             Self::WsConnect(msg) => write!(f, "WebSocket connect error: {msg}"),
             Self::WsRead(msg) => write!(f, "WebSocket read error: {msg}"),
             Self::JsonParse(msg) => write!(f, "JSON parse error: {msg}"),
+            Self::Parse(msg) => write!(f, "parse error: {msg}"),
             Self::UnknownStream(name) => write!(f, "unknown stream: {name}"),
         }
     }
@@ -226,6 +229,12 @@ impl From<tokio_tungstenite::tungstenite::Error> for StreamError {
 impl From<serde_json::Error> for StreamError {
     fn from(e: serde_json::Error) -> Self {
         Self::JsonParse(e.to_string())
+    }
+}
+
+impl From<std::num::ParseFloatError> for StreamError {
+    fn from(e: std::num::ParseFloatError) -> Self {
+        Self::Parse(e.to_string())
     }
 }
 
@@ -275,10 +284,10 @@ fn parse_book_update(text: &str, local_ts: i64) -> Result<BookUpdate, StreamErro
         StreamSource::BookTicker { .. } => {
             let ev: BookTickerEvent = serde_json::from_value(payload.data)?;
             let exch_ts = ev.transaction_time * 1_000_000;
-            let bid_price: f64 = ev.best_bid_price.parse().unwrap_or(0.0);
-            let bid_qty: f64 = ev.best_bid_qty.parse().unwrap_or(0.0);
-            let ask_price: f64 = ev.best_ask_price.parse().unwrap_or(0.0);
-            let ask_qty: f64 = ev.best_ask_qty.parse().unwrap_or(0.0);
+            let bid_price: f64 = ev.best_bid_price.parse()?;
+            let bid_qty: f64 = ev.best_bid_qty.parse()?;
+            let ask_price: f64 = ev.best_ask_price.parse()?;
+            let ask_qty: f64 = ev.best_ask_qty.parse()?;
             Ok(BookUpdate {
                 source,
                 exch_ts,
@@ -294,8 +303,8 @@ fn parse_book_update(text: &str, local_ts: i64) -> Result<BookUpdate, StreamErro
                 source,
                 exch_ts: ev.transaction_time * 1_000_000,
                 local_ts,
-                bids: parse_levels(&ev.bids),
-                asks: parse_levels(&ev.asks),
+                bids: parse_levels(&ev.bids)?,
+                asks: parse_levels(&ev.asks)?,
                 is_snapshot: false,
             })
         }
@@ -305,8 +314,8 @@ fn parse_book_update(text: &str, local_ts: i64) -> Result<BookUpdate, StreamErro
                 source,
                 exch_ts: ev.transaction_time * 1_000_000,
                 local_ts,
-                bids: parse_levels(&ev.bids),
-                asks: parse_levels(&ev.asks),
+                bids: parse_levels(&ev.bids)?,
+                asks: parse_levels(&ev.asks)?,
                 is_snapshot: false,
             })
         }
@@ -624,8 +633,8 @@ pub async fn fetch_depth_snapshot(full_url: &str) -> Result<BookUpdate, crate::u
         source: StreamSource::Snapshot, 
         exch_ts,
         local_ts,
-        bids: parse_levels(&resp.bids),
-        asks: parse_levels(&resp.asks),
+        bids: parse_levels(&resp.bids)?,
+        asks: parse_levels(&resp.asks)?,
         is_snapshot: true,
     })
 }
@@ -833,7 +842,7 @@ mod tests {
     #[test]
     fn parse_levels_empty() {
         let levels: Vec<[String; 2]> = vec![];
-        let result = parse_levels(&levels);
+        let result = parse_levels(&levels).unwrap();
         assert!(result.is_empty());
     }
 
@@ -843,7 +852,7 @@ mod tests {
             ["100.5".into(), "2.5".into()],
             ["200.0".into(), "0.0".into()],
         ];
-        let result = parse_levels(&levels);
+        let result = parse_levels(&levels).unwrap();
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].price, 100.5);
         assert_eq!(result[0].qty, 2.5);
@@ -852,10 +861,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_levels_bad_number_defaults_to_zero() {
+    fn parse_levels_bad_number_errors() {
         let levels = vec![["not_a_number".into(), "5.0".into()]];
-        let result = parse_levels(&levels);
-        assert_eq!(result[0].price, 0.0);
+        assert!(parse_levels(&levels).is_err());
     }
 
     #[test]

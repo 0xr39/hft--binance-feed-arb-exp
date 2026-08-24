@@ -13,13 +13,14 @@ pub fn now_nanos() -> i64 {
 /// Convert `[price_str, qty_str]` pairs into `PriceLevel`s.
 ///
 /// Used by both WebSocket parse helpers and REST snapshot fetch.
-pub fn parse_levels(pairs: &[[String; 2]]) -> Vec<PriceLevel> {
+///
+/// Returns an error on the first unparseable price or quantity.
+pub fn parse_levels(
+    pairs: &[[String; 2]],
+) -> Result<Vec<PriceLevel>, std::num::ParseFloatError> {
     pairs
         .iter()
-        .map(|[p, q]| PriceLevel::new(
-            p.parse().unwrap_or(0.0),
-            q.parse().unwrap_or(0.0),
-        ))
+        .map(|[p, q]| Ok(PriceLevel::new(p.parse()?, q.parse()?)))
         .collect()
 }
 
@@ -53,6 +54,12 @@ impl From<reqwest::Error> for HttpError {
 
 impl From<serde_json::Error> for HttpError {
     fn from(e: serde_json::Error) -> Self {
+        Self::Parse(e.to_string())
+    }
+}
+
+impl From<std::num::ParseFloatError> for HttpError {
+    fn from(e: std::num::ParseFloatError) -> Self {
         Self::Parse(e.to_string())
     }
 }
